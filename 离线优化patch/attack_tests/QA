@@ -1,0 +1,1993 @@
+(ortfix) pjk@pjkcomputer:~/PycharmProjects/openpilot0.9.6/CAP/attack_tests$ python quick_ort_run.py
+使用固定路径：
+ONNX_MODEL_PATH  : ../models/weights/supercombo.onnx
+IMGS_DIRECTORY   : ../data/imgs/golden-left-75m2/
+RESULTS_PATH     : results/img_test/image_eval2.csv
+OUTPUT_MAP_PKL   : ../models/weights/supercombo_output_map.pkl
+解析到的输出布局： {'lead_start': 5755, 'lead_len': 255, 'lead_stride': 51, 'lead_prob_base': 48, 'rec_state_size': 512}
+>> build ORT session: ../models/weights/supercombo.onnx
+=== ONNX Inputs ===
+[INP0] input_imgs [1, 12, 128, 256] tensor(float16)
+[INP1] big_input_imgs [1, 12, 128, 256] tensor(float16)
+[INP2] desire [1, 100, 8] tensor(float16)
+[INP3] traffic_convention [1, 2] tensor(float16)
+[INP4] lateral_control_params [1, 2] tensor(float16)
+[INP5] prev_desired_curv [1, 100, 1] tensor(float16)
+[INP6] nav_features [1, 256] tensor(float16)
+[INP7] nav_instructions [1, 150] tensor(float16)
+[INP8] features_buffer [1, 99, 512] tensor(float16)
+=== ONNX Outputs ===
+[OUT0] outputs [1, 6504] tensor(float16)
+✅ 结果已写入: results/img_test/image_eval2.csv
+dRel@0s -> mean=113.3087, std=44.0561
+dRel@2s -> mean=-4.6948, std=0.4177
+dRel@4s -> mean=-0.1099, std=0.1386
+dRel@6s -> mean=-1.3639, std=0.2069
+dRel@8s -> mean=-1.4998, std=0.1639
+dRel@10s -> mean=-1.4689, std=0.2150这样就运行成功了吗
+
+是的——**脚本已成功跑通**✅：
+
+* ORT 会话创建成功并正确识别到 **fp16** 的各输入/输出；
+* 推理完成并把结果写到了 `results/img_test/image_eval2.csv`；
+* 你看到的均值/标准差统计也正常打印出来。
+
+不过，\*\*数值异常（从 2s 起大量为负）\*\*提示两件事：
+
+1. **我们在做“原始向量切片”而非车端的完整“解析+反归一化”**
+   车端运行时会用 `Parser`/图里的 `*_denorm` 对部分 head 做反归一化与解码；我们现在是直接按 `pkl` 切片生的 `lead`，可能未做和车上一样的后处理，因此出现偏移（负值）。
+
+2. **历史缓冲都被我们置零**
+   这个模型依赖 100 帧历史（`desire[1,100,8]`、`prev_desired_curv[1,100,1]`、`features_buffer[1,99,512]` 等）。目前除了 `desire` 的最后一帧打了脉冲，其他历史特征我们全是 0，且 `big_input_imgs` 也给了 0。这样通常会把输出“吸”到一个奇怪的偏置附近（你看到 2s 后几乎常值、方差极小就很像这种现象）。
+
+---
+
+## 你可以怎么做（按易→难）：
+
+### A. 就当“能跑通”，用它做流程验证（当前状态）
+
+现在的状态可以证明：**加载→推理→写表**全部正常。若你此阶段只关心流程，已经达标。
+
+### B. 让数值更“像样”的最小改动
+
+把每次推理得到的 **rec\_state（最后 512 维）回填到 `features_buffer` 的末尾**，形成滚动历史（虽然还不是车端的全部历史，但比全 0 好很多）：
+
+在你的循环里（每对图片推理后）追加类似下面代码（注意 fp16）：
+
+```python
+# 在 y = sess.run(...) 之后
+out_vec = np.array(y[0])  # (1, 6504) float16
+rec_state = out_vec[:, -512:]  # (1,512) float16
+
+# 取出当前 feed 中的 features_buffer 并右移一位，把 rec_state 填到最后一帧
+fb = feed.get('features_buffer', None)
+if fb is not None and fb.shape == (1, 99, 512):
+    fb[:, :-1, :] = fb[:, 1:, :]
+    fb[:, -1,  :] = rec_state.astype(np.float16)
+    feed['features_buffer'] = fb  # 下一个样本继续用
+```
+
+这样做一轮下来，`features_buffer` 会逐步被“真实历史”填满，dRel 趋势通常会合理很多。
+
+> 说明：`prev_desired_curv` 也应滚动，但我们手头没做它的提取映射（它在输出向量里的切片位置需要元数据/Parser），所以先不动也可以观察效果。
+
+### C. 得到“和车上一致”的数值（严谨做法）
+
+直接按**车端路径**解析输出：
+
+* 读取 `supercombo_metadata.pkl` 的 `output_slices`；
+* 用 openpilot 的 `Parser` 对 `slice_outputs(out_vec0)` 解析（车端就这么做的）；
+* 从解析后的结构里取 lead 的物理量（会包含正确的反归一化/解码）。
+
+如果你的环境能 `import openpilot.selfdrive.modeld.parse_model_outputs`，可以把 `Parser` 接进来；或者我可以给你一段把 `metadata` + `Parser` 串起来的补丁。
+
+---
+
+## 快速自检（确认现在真的“成功”）
+
+你可以看一下 CSV 前几行，确认列名/数值都在：
+
+```bash
+python - <<'PY'
+import pandas as pd
+df = pd.read_csv("results/img_test/image_eval2.csv")
+print(df.head(5))
+print("条目数:", len(df))
+PY
+```
+
+---
+
+### 小结
+
+* 运行是**成功的**；
+* 负值主要源于**未做车端同款解析**和**历史缓冲全 0**；
+* 先按“B 方案”回填 `features_buffer` 试试；如果你希望**完全复刻车端数值口径**，我们再接入 `Parser` 做解析即可。
+
+
+
+
+
+
+
+import copy
+import torch
+import onnxruntime
+import numpy as np
+import cv2
+from sklearn.metrics import mean_squared_error
+import sys
+import os
+import csv
+import pandas as pd
+from ultralytics import YOLO
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'models'))
+from openpilot_torch import OpenPilotModel
+
+RESULTS_PATH = 'results/img_test/image_eval2.csv'
+TORCH_WEIGHTS_PATH = '../models/weights/supercombo_torch_weights.pth'
+ONNX_MODEL_PATH = '../models/weights/supercombo_server3.onnx'
+# ONNX_MODEL_PATH = '../models/weights/supercombo.onnx'
+YOLO_WEIGHTS_PATH = "../models/weights/yolov8n.pt"
+IMGS_DIRECTORY = '../data/imgs/golden-left-75m2/'
+
+# from DRP-attack repo: https://github.com/ASGuard-UCI/DRP-attack
+class AdamOptTorch:
+
+    def __init__(self, size, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, dtype=torch.float32):
+        self.exp_avg = torch.zeros(size, dtype=dtype)
+        self.exp_avg_sq = torch.zeros(size, dtype=dtype)
+        self.beta1 = torch.tensor(beta1)
+        self.beta2 = torch.tensor(beta2)
+        self.eps = eps
+        self.lr = lr
+        self.step = 0
+
+    def update(self, grad):
+
+        self.step += 1
+
+        bias_correction1 = 1 - self.beta1 ** self.step
+        bias_correction2 = 1 - self.beta2 ** self.step
+
+        self.exp_avg = self.beta1 * self.exp_avg + (1 - self.beta1) * grad
+        self.exp_avg_sq = self.beta2 * self.exp_avg_sq + (1 - self.beta2) * (grad ** 2)
+
+        denom = (torch.sqrt(self.exp_avg_sq) / torch.sqrt(bias_correction2)) + self.eps
+
+        step_size = self.lr / bias_correction1
+
+        return step_size / denom * self.exp_avg
+
+def sigmoid(x):
+	return 1 / (1 + np.exp(-x))
+
+def estimate_torch(model, input_imgs, desire, traffic_convention, recurrent_state):
+    if not isinstance(input_imgs, torch.Tensor):
+        input_imgs = torch.tensor(input_imgs).float()
+    if not isinstance(desire, torch.Tensor):
+        desire = torch.tensor(desire).float()
+        traffic_convention = torch.tensor(traffic_convention).float()
+    if not isinstance(recurrent_state, torch.Tensor):
+        recurrent_state = torch.tensor(recurrent_state).float()
+
+    out = model(input_imgs, desire, traffic_convention, recurrent_state)
+
+    lead = out[0, 5755:6010]
+    drel = []
+    for t in range(6):
+        x_predt = lead[4*t::51]
+        if t < 3:
+            prob = lead[48+t::51]
+            current_most_likely_hypo = torch.argmax(prob)
+            drelt = x_predt[current_most_likely_hypo]
+        else:
+            drelt = torch.mean(x_predt)
+        drel.append(drelt)#不同t（时间点）的距离预测
+
+    rec_state = out[:, -512:]
+    return drel, rec_state
+
+def estimate_onnx(model, input_imgs, desire, traffic_convention, recurrent_state):
+    out = model.run(['outputs'], {
+        'input_imgs': input_imgs,
+        'desire': desire,
+        'traffic_convention': traffic_convention,
+        'initial_state': recurrent_state
+    })
+
+    out = np.array(out[0])
+
+    lead = out[0, 5755:6010]
+    drel = []
+    for t in range(6):
+        x_predt = lead[4*t::51]
+        if t < 3:
+            prob = lead[48+t::51]
+            current_most_likely_hypo = np.argmax(prob)
+            drelt = x_predt[current_most_likely_hypo]
+        else:
+            drelt = np.mean(x_predt)
+        drel.append(drelt)
+
+    rec_state = out[:, -512:]
+    return drel, rec_state
+
+def parse_image(frame):
+	H = (frame.shape[0]*2)//3
+	W = frame.shape[1]
+	parsed = np.zeros((6, H//2, W//2), dtype=np.uint8)
+
+	parsed[0] = frame[0:H:2, 0::2] # even column, even row
+	parsed[1] = frame[1:H:2, 0::2] # odd column, even row
+	parsed[2] = frame[0:H:2, 1::2] # even column, odd row
+	parsed[3] = frame[1:H:2, 1::2] # odd column, even row
+	parsed[4] = frame[H:H+H//4].reshape((-1, H//2,W//2))
+	parsed[5] = frame[H+H//4:H+H//2].reshape((-1, H//2,W//2))
+
+	return parsed
+
+def read_image(path):
+    img = cv2.imread(path)
+    img = cv2.resize(img, (512, 256)) # resize to fit model requirements
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2YUV_I420) # change color channel to YUV rather than BGR
+    img = parse_image(img) # parse according to model input
+
+    return img
+
+
+def prepare_input(img1_path, img2_path, traffic_convention='right'):
+    img1 = read_image(img1_path)
+    img2 = read_image(img2_path)
+    input_imgs = np.r_[img1, img2][np.newaxis, ...]
+
+    desire = np.zeros(shape=(1, 8))
+    desire[0, 0] = 1
+    if traffic_convention == 'left':
+        traffic_convention = np.array([[0, 1]])
+    else:
+        traffic_convention = np.array([[1, 0]])
+    recurrent_state = np.zeros(shape=(1, 512))
+
+    return input_imgs.astype(np.float32), desire.astype(np.float32), traffic_convention.astype(np.float32), recurrent_state.astype(np.float32)
+
+def load_torch_model(path):
+    model = OpenPilotModel()
+    model.load_state_dict(torch.load(path))
+    model.eval()
+
+    return model
+
+# finds the RMSE between Torch and ONNX model outputs for two given images
+def run_comparison(img1_path, img2_path, traffic_convention='right', verbose=True, rec_states=None):
+    torch_model = load_torch_model(TORCH_WEIGHTS_PATH)
+    onnx_model = onnxruntime.InferenceSession(ONNX_MODEL_PATH)
+
+    input_imgs, desire, traffic_convention, recurrent_state0 = prepare_input(img1_path, img2_path, traffic_convention)
+
+    if rec_states is None:
+        torch_rec_state = recurrent_state0
+        onnx_rec_state = recurrent_state0
+    else:
+        torch_rec_state, onnx_rec_state = rec_states
+
+
+    # torch_model = load_torch_model()
+    torch_drel, torch_rec_state = estimate_torch(torch_model, input_imgs, desire, traffic_convention, torch_rec_state)
+    torch_drel = [v.detach().numpy() for v in torch_drel]
+    print(torch_drel[0])
+
+    if verbose:
+        print('######## PyTorch Output #########')
+        print('Lead vehicle relative distance (0, 2, 4, 6, 8, 10) s:', torch_drel)
+        print()
+
+    # onnx_model = onnxruntime.InferenceSession(r"C:\Users\Max\Documents\UVA Docs\Second Year Classes\Research\ADS\openpilot_model\supercombo_server3.onnx")
+    onnx_drel, onnx_rec_state = estimate_onnx(onnx_model, input_imgs, desire, traffic_convention, onnx_rec_state)
+
+    if verbose:
+        print('######## ONNX Output #########')
+        print('Lead vehicle relative distance (0, 2, 4, 6, 8, 10) s:', onnx_drel)
+        print()
+
+    drel_rmse = np.sqrt(mean_squared_error(torch_drel, onnx_drel))
+
+    if verbose:
+        print('dRel RMSE:', drel_rmse)
+
+    rec_states = (torch_rec_state, onnx_rec_state)
+    return torch_drel, onnx_drel, drel_rmse, rec_states
+
+def build_yuv_patch(thres, patch_dim, patch_start):
+    patch_height, patch_width = patch_dim
+    patch_y, patch_x = patch_start # top-left is (0, 0) horizontal is x, vertical is y
+    # h_ratio = 256/874
+    # w_ratio = 512/1164
+    h_ratio = 256/1208
+    w_ratio = 512/1928
+
+    y_patch_height = int(patch_height*h_ratio)
+    y_patch_width = int(patch_width*w_ratio)
+    y_patch_h_start = int(patch_y*h_ratio)
+    y_patch_w_start = int(patch_x*w_ratio)
+
+    y_patch = thres * np.random.rand(y_patch_height, y_patch_width).astype('float32')
+    # u_patch = thres * np.random.rand()
+    h_bounds = (y_patch_h_start, y_patch_h_start+y_patch_height)
+    w_bounds = (y_patch_w_start, y_patch_w_start+y_patch_width)
+    return y_patch, h_bounds, w_bounds
+
+def parse_image_multi(frames):
+    n = frames.shape[0] # should always be 2
+    H = (frames.shape[1]*2)//3 # 128
+    W = frames.shape[2] # 256
+
+    parsed = torch.zeros(size=(n, 6, H//2, W//2)).float()
+
+
+    parsed[:, 0] = frames[:, 0:H:2, 0::2] # even column, even row
+    parsed[:, 1] = frames[:, 1:H:2, 0::2] # odd column, even row
+    parsed[:, 2] = frames[:, 0:H:2, 1::2] # even column, odd row
+    parsed[:, 3] = frames[:, 1:H:2, 1::2] # odd column, even row
+    parsed[:, 4] = frames[:, H:H+H//4].reshape((n, H//2,W//2))
+    parsed[:, 5] = frames[:, H+H//4:H+H//2].reshape((n, H//2,W//2))
+
+    return parsed
+
+# creates and optimizes patch and evaluates its effectiveness, also finds RMSE between models
+def run_patched_comparison(img1_path, img2_path, models, traffic_convention='right', verbose=True, rec_states=None):
+    pred_times = [0, 2, 4, 6, 8, 10]
+    dim = (512, 256)
+    thres = 1
+    mask_iterations = 10
+
+    torch_model, onnx_model, yolo_model = models
+
+    # set up inputs
+    desire = np.zeros(shape=(1, 8)).astype('float32')
+    traffic_convention = np.array([[1, 0]]).astype('float32')
+    if rec_states is None:
+        torch_rec_state = np.zeros(shape=(1, 512)).astype('float32')
+        onnx_rec_state = np.zeros(shape=(1, 512)).astype('float32')
+    else:
+        torch_rec_state, onnx_rec_state = rec_states
+
+
+    # read in images
+    img1 = cv2.imread(img1_path)
+    img2 = cv2.imread(img2_path)
+
+    ### locate and build patch for image 2 ###
+    results = yolo_model(img2, verbose=False)
+    boxes = results[0].boxes
+
+    # choose largest box found
+    max_size = 0
+    for i in range(len(boxes)):
+        box_ = boxes[i].xyxy
+        size = (box_[0, 3] - box_[0, 1])*(box_[0, 2] - box_[0, 0])
+        if size > max_size:
+            box = box_
+            max_size = size
+
+    # if no object found, attack 1 pixel in the center of the image
+    if len(boxes) == 0:
+        box = torch.tensor([[437, 582, 438, 583]])
+
+    if isinstance(box, torch.Tensor):
+        box = box.int().cpu().numpy()
+    else:
+        box = box.astype('int32')
+
+    patch_start = (box[0, 1], box[0, 0])
+    patch_dim = (box[0, 3] - box[0, 1], box[0, 2] - box[0, 0])
+
+    patch, h_bounds, w_bounds = build_yuv_patch(thres, patch_dim, patch_start)
+    patch = torch.tensor(patch, requires_grad=True)
+    adam = AdamOptTorch(patch.shape, lr = 1)
+
+    # convert images to YUV I420
+    img1 = cv2.resize(img1, dim)
+    img2 = cv2.resize(img2, dim)
+    img1_yuv = cv2.cvtColor(img1, cv2.COLOR_BGR2YUV_I420).astype('float32')
+    img2_yuv = cv2.cvtColor(img2, cv2.COLOR_BGR2YUV_I420).astype('float32')
+    proc_images = [img1_yuv, img2_yuv]
+
+    # initial pass through
+    input_imgs = parse_image_multi(torch.tensor(np.array(proc_images))).reshape(1, 12, 128, 256)
+    torch_init_drel, torch_rec_state = estimate_torch(torch_model, input_imgs, desire, traffic_convention, torch_rec_state)
+    onnx_init_drel, onnx_rec_state = estimate_onnx(onnx_model, input_imgs.detach().numpy(), desire, traffic_convention, onnx_rec_state)
+
+    torch_init_drel = [v.detach().numpy() for v in torch_init_drel]
+    init_drel_rmse = np.sqrt(mean_squared_error(torch_init_drel, onnx_init_drel))
+    init_results = (torch_init_drel, onnx_init_drel, init_drel_rmse)
+    print('\t Initial relative distance predictions未加patch的预测结果:', onnx_init_drel[0], "(ONNX),", torch_init_drel[0], "(Torch)")
+
+    ### optimize patch ###
+    for it in range(mask_iterations):
+        # print(it)
+        # apply new patch to the image
+        patch = torch.clip(patch, -thres, thres)
+        tmp_pimgs = torch.tensor(np.array(copy.deepcopy(proc_images))).float()
+        tmp_pimgs[:, h_bounds[0]:h_bounds[1], w_bounds[0]:w_bounds[1]] += patch
+
+        tmp_pimgs = parse_image_multi(tmp_pimgs)
+        input_imgs = tmp_pimgs.reshape(1, 12, 128, 256)
+
+        # pass newly masked image through the model
+        torch_drel, _ = estimate_torch(torch_model, input_imgs, desire, traffic_convention, torch_rec_state)
+
+        if it == 0:
+            print('\t Relative distance prediction with random patch:随机patch的预测结果', torch_drel[0].detach().numpy())
+
+        patch.retain_grad()
+        torch_drel[0].backward(retain_graph=True)
+        grad = patch.grad
+
+        # update patch
+        update = adam.update(grad)
+        patch = patch.clone().detach().requires_grad_(True) + update
+        torch_rec_state = torch_rec_state.clone().detach()
+
+    # create input with optimized patch
+    patch = torch.clip(patch, -thres, thres)
+    tmp_pimgs = torch.tensor(np.array(copy.deepcopy(proc_images))).float()
+    tmp_pimgs[:, h_bounds[0]:h_bounds[1], w_bounds[0]:w_bounds[1]] += patch
+    tmp_pimgs = parse_image_multi(tmp_pimgs)
+    input_imgs = tmp_pimgs.reshape(1, 12, 128, 256)
+
+    ### send patched input through model ###
+    torch_drel, torch_rec_state = estimate_torch(torch_model, input_imgs, desire, traffic_convention, torch_rec_state)
+    torch_drel = [v.detach().numpy() for v in torch_drel]
+    onnx_drel, onnx_rec_state = estimate_onnx(onnx_model, input_imgs.detach().numpy(), desire, traffic_convention, onnx_rec_state)
+
+    if verbose:
+        print('######## PyTorch Output #########')
+        print('攻击后pytorch的距离Lead vehicle relative distance (0, 2, 4, 6, 8, 10) s:', torch_drel)
+        print()
+
+    if verbose:
+        print('######## ONNX Output #########')
+        print('攻击后onnx的距离Lead vehicle relative distance (0, 2, 4, 6, 8, 10) s:', onnx_drel)
+        print()
+
+    drel_rmse = np.sqrt(mean_squared_error(torch_drel, onnx_drel))
+
+    if verbose:
+        print('dRel RMSE:', drel_rmse)
+
+    print('\t 第0个距离的大小Relative distance prediction with optimized patch:', torch_drel[0], '| Patch size:', patch_dim)
+
+    rec_states = (torch_rec_state.clone().detach(), onnx_rec_state)
+    optmask_results = (torch_drel, onnx_drel, drel_rmse)
+    return init_results,  optmask_results, rec_states
+
+# analyze all images (RMSE only)
+def run_comparison_all():
+    with open(RESULTS_PATH, 'a', newline='') as f:
+            writer = csv.writer(f)
+            row = ['Image',
+                   'Torch_dRel0', 'Torch_dRel2', 'Torch_dRel4', 'Torch_dRel6', 'Torch_dRel8', 'Torch_dRel10',
+                   'ONNX_dRel0', 'ONNX_dRel2', 'ONNX_dRel4', 'ONNX_dRel6', 'ONNX_dRel8', 'ONNX_dRel10',
+                   'RMSE']
+            writer.writerow(row)
+
+
+    paths = [p for p in os.listdir(IMGS_DIRECTORY) if p.endswith('.png')]
+
+    rec_states = None
+    for i in range(1, len(paths)):
+        img1_path = os.path.join(IMGS_DIRECTORY, paths[i-1])
+        img2_path = os.path.join(IMGS_DIRECTORY, paths[i])
+
+        torch_drel, onnx_drel, drel_rmse, rec_states = run_comparison(img1_path, img2_path, traffic_convention='right', verbose=False, rec_states=rec_states)
+        print(i, torch_drel[0])
+
+        with open(RESULTS_PATH, 'a', newline='') as f:
+            writer = csv.writer(f)
+            row = [i] + list(torch_drel) + list(onnx_drel) + [drel_rmse]
+            writer.writerow(row)
+
+    print('Done!')
+
+
+# analyze all images
+def run_patched_comparison_all():
+
+    with open(RESULTS_PATH, 'a', newline='') as f:
+            writer = csv.writer(f)
+            row = ['Image',
+                   'Torch_init_dRel0', 'Torch_init_dRel2', 'Torch_init_dRel4', 'Torch_init_dRel6', 'Torch_init_dRel8', 'Torch_init_dRel10',
+                   'Torch_optmask_dRel0', 'Torch_optmask_dRel2', 'Torch_optmask_dRel4', 'Torch_optmask_dRel6', 'Torch_optmask_dRel8', 'Torch_optmask_dRel10',
+                   'ONNX_init_dRel0', 'ONNX_init_dRel2', 'ONNX_init_dRel4', 'ONNX_init_dRel6', 'ONNX_init_dRel8', 'ONNX_init_dRel10',
+                   'ONNX_optmask_dRel0', 'ONNX_optmask_dRel2', 'ONNX_optmask_dRel4', 'ONNX_optmask_dRel6', 'ONNX_optmask_dRel8', 'ONNX_optmask_dRel10',
+                   'RMSE_init', 'RMSE_optmask', 'optmask_drel_effect']
+            writer.writerow(row)
+
+
+    torch_model = load_torch_model(TORCH_WEIGHTS_PATH)
+    onnx_model = onnxruntime.InferenceSession(ONNX_MODEL_PATH)
+    yolo_model = YOLO(YOLO_WEIGHTS_PATH)
+    models = (torch_model, onnx_model, yolo_model)
+
+    paths = [p for p in os.listdir(IMGS_DIRECTORY) if p.endswith('.png')]
+
+    rec_states = None
+    for i in range(1, len(paths)):
+        img1_path = os.path.join(IMGS_DIRECTORY, paths[i-1])
+        img2_path = os.path.join(IMGS_DIRECTORY, paths[i])
+
+        print(f"Analyzing images {i-1} & {i}")
+        init_results,  optmask_results, rec_states = run_patched_comparison(
+            img1_path,
+            img2_path,
+            models,
+            traffic_convention='right',
+            verbose=False,
+            rec_states=rec_states,
+        )
+
+        torch_init_drel, onnx_init_drel, init_drel_rmse = init_results
+        torch_optmask_drel, onnx_optmask_drel, opt_drel_rmse = optmask_results
+
+        optmask_drel_effect = onnx_optmask_drel[0] - onnx_init_drel[0]
+
+        with open(RESULTS_PATH, 'a', newline='') as f:
+            writer = csv.writer(f)
+            row = [i] + list(torch_init_drel) + list(torch_optmask_drel) + list(onnx_init_drel) + list(onnx_optmask_drel) + [init_drel_rmse, opt_drel_rmse, optmask_drel_effect]
+            writer.writerow(row)
+
+    print('Done!')
+
+
+def collect_results():
+    df = pd.read_csv(RESULTS_PATH)
+
+    for t in range(0, 11, 2):
+        error = df['Torch_dRel'+str(t)] - df['ONNX_dRel'+str(t)]
+        rmse = np.sqrt(np.mean(error.pow(2)))
+        print('dRel RMSE for time {}: {}'.format(t, rmse))
+
+
+    bounds = [0, 20, 40, 60, 80, 2147483647]
+    t_cols = ['Torch_dRel'+str(t) for t in range(0, 12, 2)]
+    o_cols = ['ONNX_dRel'+str(t) for t in range(0, 12, 2)]
+
+    for i in range(1, len(bounds)):
+        t_predictions_within_bounds = np.all([df[t_cols] > bounds[i-1], df[t_cols] <= bounds[i]], axis=0) # all entries where estimate is within (L, U]
+        o_predictions_within_bounds = np.all([df[o_cols] > bounds[i-1], df[o_cols] <= bounds[i]], axis=0)
+        if not np.all(t_predictions_within_bounds == o_predictions_within_bounds):
+            print(':( at ', t)
+        t_mask = np.array(df[t_cols]*t_predictions_within_bounds)
+        o_mask = np.array(df[o_cols]*o_predictions_within_bounds)
+        rmse = np.sqrt(np.mean(np.power(o_mask - t_mask, 2)))
+        print('dRel RMSE for estimates within ({}, {}]'.format(bounds[i-1], bounds[i]), rmse)
+
+    rmse = np.mean(df['RMSE'])
+    print('Overall RMSE:', rmse)
+
+def collect_results_patched(col_type='init'):
+    df = pd.read_csv(RESULTS_PATH)
+
+    for t in range(0, 11, 2):
+        error = df[f'Torch_{col_type}_dRel{t}'] - df[f'ONNX_{col_type}_dRel{t}']
+        rmse = np.sqrt(np.mean(error.pow(2)))
+        print('dRel RMSE for time {}: {}'.format(t, rmse))
+
+
+    bounds = [0, 20, 40, 60, 80, 2147483647]
+    t_cols = [f'Torch_{col_type}_dRel{t}' for t in range(0, 12, 2)]
+    o_cols = [f'ONNX_{col_type}_dRel{t}' for t in range(0, 12, 2)]
+
+    for i in range(1, len(bounds)):
+        # t_predictions_within_bounds = np.all([df[t_cols] > bounds[i-1], df[t_cols] <= bounds[i]], axis=0) # all entries where estimate is within (L, U]
+        o_predictions_within_bounds = np.all([df[o_cols] > bounds[i-1], df[o_cols] <= bounds[i]], axis=0)
+        # if not np.all(t_predictions_within_bounds == o_predictions_within_bounds):
+        #     print(':( at ', t)
+        t_mask = np.array(df[t_cols]*o_predictions_within_bounds)
+        o_mask = np.array(df[o_cols]*o_predictions_within_bounds)
+        rmse = np.sqrt(np.mean(np.power(o_mask - t_mask, 2)))
+        print('dRel RMSE for estimates within ({}, {}] :'.format(bounds[i-1], bounds[i]), rmse)
+
+    rmse = np.mean(df[f'RMSE_{col_type}'])
+    print('Overall RMSE:', rmse)
+
+    if col_type == 'optmask':
+        avg_optmask_effect = np.mean(df['optmask_drel_effect'])
+        std_optmask_effect = np.std(df['optmask_drel_effect'])
+        print('Optimized patch\'s effect on relative distance:', avg_optmask_effect, '(mean),', std_optmask_effect, '(std)')
+
+if __name__ == '__main__':
+    results_dir, file_name = os.path.split(RESULTS_PATH)
+    if not os.path.exists(results_dir):
+        os.mkdir(results_dir)
+
+    i = 1
+    while os.path.exists(RESULTS_PATH):
+        file_name = 'image_eval_' + str(i) + '.csv'
+        RESULTS_PATH = os.path.join(results_dir, file_name)
+        i += 1
+
+    print('Writing results to:', RESULTS_PATH)
+    f = open(RESULTS_PATH, "x")
+    f.close()
+
+    run_patched_comparison_all()
+
+    print('### init results ###')
+    collect_results_patched('init')
+    print('### optmask results ###')
+    collect_results_patched('optmask')
+    和这个模型的输入逻辑是否有区别？在哪儿？
+
+
+是有区别的，而且差异点很关键。你这份脚本当前是为 **`supercombo_server3.onnx`**（服务器/评测版）写的；而 **`supercombo.onnx`**（车端版）在**输入名字、形状、历史缓冲、数据类型**上都不一样。对照如下：
+
+# 和你脚本匹配的：`supercombo_server3.onnx`
+
+* **输入（float32）**
+
+  * `input_imgs`: `(1, 12, 128, 256)`
+  * `desire`: `(1, 8)`（单帧 one-hot）
+  * `traffic_convention`: `(1, 2)`
+  * `initial_state`: `(1, 512)`（上一帧隐状态）
+* **输出**
+
+  * `outputs`：拼接向量（脚本用固定切片 `5755:6010` 取 `lead`，末尾 `512` 取下一帧隐状态）
+* **你的代码对齐的位置**
+
+  * `prepare_input(...)`：正是 `(1,12,128,256)` + `(1,8)` + `(1,2)` + `(1,512)`（float32）
+  * `estimate_onnx(...)`：只喂上述 4 个键
+  * 递归状态：用 `initial_state` 喂入，`out[:,-512:]` 接着传给下一对帧
+
+# 和车端模型 `supercombo.onnx` 的差别（导致你之前报错/段错误的根因）
+
+* **输入名字更多，且全部是 `float16`（fp16）**：
+
+  * `input_imgs` **fp16** `(1,12,128,256)`
+  * `big_input_imgs` **fp16** `(1,12,128,256)`（第二路输入）
+  * `desire` **fp16** `(1, 100, 8)`（含 100 帧时间维的历史+当前）
+  * `traffic_convention` **fp16** `(1,2)`
+  * `lateral_control_params` **fp16** `(1,2)`（\[vEgo, steer\_delay]）
+  * `prev_desired_curv` **fp16** `(1,100,1)`（历史曲率）
+  * `nav_features` **fp16** `(1,256)`
+  * `nav_instructions` **fp16** `(1,150)`
+  * `features_buffer` **fp16** `(1,99,512)`（历史隐藏状态，不再用 `initial_state` 这个名字）
+* **输出**
+
+  * `outputs`：也是拼接向量，但一般是 **fp16**，长度可能不同（你打印看到是 `6504`）
+* **关键逻辑差异**
+
+  1. **数据类型**：车端版全部 `float16`；你的脚本用的是 `float32`（会触发 “expected fp16, got fp32”）。
+  2. **时间/历史**：车端要 **100 帧历史**（`desire/prev_desired_curv/features_buffer`），而 server3 只要单帧 + `initial_state`。
+  3. **输入键集合**：车端需要更多键（`big_input_imgs、lateral_control_params、nav_*、features_buffer...`），你的脚本只喂了 4 个键。
+  4. **递归状态接口**：车端通过 `features_buffer` 等历史张量滚动；server3 用 `initial_state` 单张量往返。
+
+# 结论：你的这份脚本和 **`supercombo_server3.onnx` 完全对齐**；和 **`supercombo.onnx`** 不对齐的地方在：
+
+1. `prepare_input` 的**形状/历史维**与**dtype**（需要 fp16 + 带时间维）
+2. `estimate_onnx` 的**feed 字典键集合**（需要喂更多输入，不是 4 个）
+3. **递归/历史的传递方式**（`initial_state` vs `features_buffer` 等）
+
+如果你要把这份脚本改成兼容 `supercombo.onnx`：
+
+* 把所有输入/中间量改为 **np.float16**；
+* `desire` 改为 `(1,100,8)`，最后一帧 one-hot 打 1，其余为历史（可先置零）；
+* 增加并喂 `big_input_imgs、lateral_control_params、prev_desired_curv、nav_features、nav_instructions、features_buffer`（形状如上，先置零能跑通）；
+* 不再使用 `initial_state` 键；如果想更稳，推理后把 `outputs` 末尾 512 维当作“最新隐藏状态”，**滚动填充**到 `features_buffer` 的最后一帧，再喂下一对图片。
+
+但如果你的目标是**验证 Torch 与 ONNX 一致性/做对比与攻击评估**，继续使用 **`supercombo_server3.onnx`** 是最省事、最稳定的选择——你的代码已经是为它写的。
+
+
+
+
+
+
+
+
+
+ONNX_MODEL_PATH    = '../models/weights/supercombo.onnx'但是quick_ort_run.py里面加载的就是supercombo.onnx啊，supercombo.onnx有经过处理吗？
+对，你这次运行的确是**直接加载原始的 `supercombo.onnx`**，没有被改写处理过。
+
+关键信号有两个：
+
+1. 日志里明确打印了
+   `>> build ORT session: ../models/weights/supercombo.onnx`，
+   后面立刻成功列出了输入/输出（没出现“简化后再试”的提示路径），说明**没走 onnx-simplifier 的兜底流程**。
+2. 我们做的是**运行时适配**，不是离线改模型：
+
+   * 把所有喂入的 dtype 改为 `float16` 并严格按模型声明的形状去构造（如 `desire[1,100,8]`、`features_buffer[1,99,512]` 等）；
+   * 禁用了 ORT 的图优化（`ORT_DISABLE_OPTIMIZER=1` + `SessionOptions` 里 `ORT_DISABLE_ALL`）；
+     这些都是“会话配置/输入匹配”，**不会改动磁盘上的 onnx 文件**。
+
+### 如何确认是否进行过“简化/转换”
+
+* 如果触发了简化，我的脚本会打印类似：
+  `[onnx-simplifier] 简化完成 -> /tmp/supercombo_simplified_xxx.onnx`，
+  并且随后 `build ORT session:` 会指向**这个新路径**。你这次运行没有这两行，说明没简化。
+* 你也可以手动对 `supercombo.onnx` 做哈希校验（确认文件未变）：
+
+  ```bash
+  md5sum ../models/weights/supercombo.onnx
+  ```
+
+### 想“强制”简化怎么办？
+
+如果你想显式地生成一份更“ORT 友好”的模型文件，再用它跑：
+
+```bash
+pip install onnx onnxsim
+python - <<'PY'
+import onnx, onnxsim
+src = "../models/weights/supercombo.onnx"
+dst = "../models/weights/supercombo_simplified.onnx"
+m = onnx.load(src)
+m2, ok = onnxsim.simplify(m, skip_shape_inference=True, skip_optimization=True, skip_fuse_bn=True)
+assert ok, "simplify failed"
+onnx.save(m2, dst)
+print("saved:", dst)
+PY
+```
+
+然后把 `ONNX_MODEL_PATH` 改成 `../models/weights/supercombo_simplified.onnx` 再跑即可。
+
+**总结**：当前 `quick_ort_run.py` 是在**不修改 onnx 文件**的前提下，通过**正确的输入 dtype/形状** + **关闭 ORT 优化**把原始 `supercombo.onnx` 跑通了；模型本体没有被处理过。
+
+
+
+
+那我接下来想要按照import copy
+import torch
+import onnxruntime
+import numpy as np
+import cv2
+from sklearn.metrics import mean_squared_error
+import sys
+import os
+import csv
+import pandas as pd
+from ultralytics import YOLO
+
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'models'))
+from openpilot_torch import OpenPilotModel
+
+RESULTS_PATH = 'results/img_test/image_eval2.csv'
+TORCH_WEIGHTS_PATH = '../models/weights/supercombo_torch_weights.pth'
+ONNX_MODEL_PATH = '../models/weights/supercombo_server3.onnx'
+# ONNX_MODEL_PATH = '../models/weights/supercombo.onnx'
+YOLO_WEIGHTS_PATH = "../models/weights/yolov8n.pt"
+IMGS_DIRECTORY = '../data/imgs/golden-left-75m2/'
+
+# from DRP-attack repo: https://github.com/ASGuard-UCI/DRP-attack
+class AdamOptTorch:
+
+    def __init__(self, size, lr=1e-3, beta1=0.9, beta2=0.999, eps=1e-8, dtype=torch.float32):
+        self.exp_avg = torch.zeros(size, dtype=dtype)
+        self.exp_avg_sq = torch.zeros(size, dtype=dtype)
+        self.beta1 = torch.tensor(beta1)
+        self.beta2 = torch.tensor(beta2)
+        self.eps = eps
+        self.lr = lr
+        self.step = 0
+
+    def update(self, grad):
+
+        self.step += 1
+
+        bias_correction1 = 1 - self.beta1 ** self.step
+        bias_correction2 = 1 - self.beta2 ** self.step
+
+        self.exp_avg = self.beta1 * self.exp_avg + (1 - self.beta1) * grad
+        self.exp_avg_sq = self.beta2 * self.exp_avg_sq + (1 - self.beta2) * (grad ** 2)
+
+        denom = (torch.sqrt(self.exp_avg_sq) / torch.sqrt(bias_correction2)) + self.eps
+
+        step_size = self.lr / bias_correction1
+
+        return step_size / denom * self.exp_avg
+
+def sigmoid(x):
+	return 1 / (1 + np.exp(-x))
+
+def estimate_torch(model, input_imgs, desire, traffic_convention, recurrent_state):
+    if not isinstance(input_imgs, torch.Tensor):
+        input_imgs = torch.tensor(input_imgs).float()
+    if not isinstance(desire, torch.Tensor):
+        desire = torch.tensor(desire).float()
+        traffic_convention = torch.tensor(traffic_convention).float()
+    if not isinstance(recurrent_state, torch.Tensor):
+        recurrent_state = torch.tensor(recurrent_state).float()
+
+    out = model(input_imgs, desire, traffic_convention, recurrent_state)
+
+    lead = out[0, 5755:6010]
+    drel = []
+    for t in range(6):
+        x_predt = lead[4*t::51]
+        if t < 3:
+            prob = lead[48+t::51]
+            current_most_likely_hypo = torch.argmax(prob)
+            drelt = x_predt[current_most_likely_hypo]
+        else:
+            drelt = torch.mean(x_predt)
+        drel.append(drelt)#不同t（时间点）的距离预测
+
+    rec_state = out[:, -512:]
+    return drel, rec_state
+
+def estimate_onnx(model, input_imgs, desire, traffic_convention, recurrent_state):
+    out = model.run(['outputs'], {
+        'input_imgs': input_imgs,
+        'desire': desire,
+        'traffic_convention': traffic_convention,
+        'initial_state': recurrent_state
+    })
+
+    out = np.array(out[0])
+
+    lead = out[0, 5755:6010]
+    drel = []
+    for t in range(6):
+        x_predt = lead[4*t::51]
+        if t < 3:
+            prob = lead[48+t::51]
+            current_most_likely_hypo = np.argmax(prob)
+            drelt = x_predt[current_most_likely_hypo]
+        else:
+            drelt = np.mean(x_predt)
+        drel.append(drelt)
+
+    rec_state = out[:, -512:]
+    return drel, rec_state
+
+def parse_image(frame):
+	H = (frame.shape[0]*2)//3
+	W = frame.shape[1]
+	parsed = np.zeros((6, H//2, W//2), dtype=np.uint8)
+
+	parsed[0] = frame[0:H:2, 0::2] # even column, even row
+	parsed[1] = frame[1:H:2, 0::2] # odd column, even row
+	parsed[2] = frame[0:H:2, 1::2] # even column, odd row
+	parsed[3] = frame[1:H:2, 1::2] # odd column, even row
+	parsed[4] = frame[H:H+H//4].reshape((-1, H//2,W//2))
+	parsed[5] = frame[H+H//4:H+H//2].reshape((-1, H//2,W//2))
+
+	return parsed
+
+def read_image(path):
+    img = cv2.imread(path)
+    img = cv2.resize(img, (512, 256)) # resize to fit model requirements
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2YUV_I420) # change color channel to YUV rather than BGR
+    img = parse_image(img) # parse according to model input
+
+    return img
+
+
+def prepare_input(img1_path, img2_path, traffic_convention='right'):
+    img1 = read_image(img1_path)
+    img2 = read_image(img2_path)
+    input_imgs = np.r_[img1, img2][np.newaxis, ...]
+
+    desire = np.zeros(shape=(1, 8))
+    desire[0, 0] = 1
+    if traffic_convention == 'left':
+        traffic_convention = np.array([[0, 1]])
+    else:
+        traffic_convention = np.array([[1, 0]])
+    recurrent_state = np.zeros(shape=(1, 512))
+
+    return input_imgs.astype(np.float32), desire.astype(np.float32), traffic_convention.astype(np.float32), recurrent_state.astype(np.float32)
+
+def load_torch_model(path):
+    model = OpenPilotModel()
+    model.load_state_dict(torch.load(path))
+    model.eval()
+
+    return model
+
+# finds the RMSE between Torch and ONNX model outputs for two given images
+def run_comparison(img1_path, img2_path, traffic_convention='right', verbose=True, rec_states=None):
+    torch_model = load_torch_model(TORCH_WEIGHTS_PATH)
+    onnx_model = onnxruntime.InferenceSession(ONNX_MODEL_PATH)
+
+    input_imgs, desire, traffic_convention, recurrent_state0 = prepare_input(img1_path, img2_path, traffic_convention)
+
+    if rec_states is None:
+        torch_rec_state = recurrent_state0
+        onnx_rec_state = recurrent_state0
+    else:
+        torch_rec_state, onnx_rec_state = rec_states
+
+
+    # torch_model = load_torch_model()
+    torch_drel, torch_rec_state = estimate_torch(torch_model, input_imgs, desire, traffic_convention, torch_rec_state)
+    torch_drel = [v.detach().numpy() for v in torch_drel]
+    print(torch_drel[0])
+
+    if verbose:
+        print('######## PyTorch Output #########')
+        print('Lead vehicle relative distance (0, 2, 4, 6, 8, 10) s:', torch_drel)
+        print()
+
+    # onnx_model = onnxruntime.InferenceSession(r"C:\Users\Max\Documents\UVA Docs\Second Year Classes\Research\ADS\openpilot_model\supercombo_server3.onnx")
+    onnx_drel, onnx_rec_state = estimate_onnx(onnx_model, input_imgs, desire, traffic_convention, onnx_rec_state)
+
+    if verbose:
+        print('######## ONNX Output #########')
+        print('Lead vehicle relative distance (0, 2, 4, 6, 8, 10) s:', onnx_drel)
+        print()
+
+    drel_rmse = np.sqrt(mean_squared_error(torch_drel, onnx_drel))
+
+    if verbose:
+        print('dRel RMSE:', drel_rmse)
+
+    rec_states = (torch_rec_state, onnx_rec_state)
+    return torch_drel, onnx_drel, drel_rmse, rec_states
+
+def build_yuv_patch(thres, patch_dim, patch_start):
+    patch_height, patch_width = patch_dim
+    patch_y, patch_x = patch_start # top-left is (0, 0) horizontal is x, vertical is y
+    # h_ratio = 256/874
+    # w_ratio = 512/1164
+    h_ratio = 256/1208
+    w_ratio = 512/1928
+
+    y_patch_height = int(patch_height*h_ratio)
+    y_patch_width = int(patch_width*w_ratio)
+    y_patch_h_start = int(patch_y*h_ratio)
+    y_patch_w_start = int(patch_x*w_ratio)
+
+    y_patch = thres * np.random.rand(y_patch_height, y_patch_width).astype('float32')
+    # u_patch = thres * np.random.rand()
+    h_bounds = (y_patch_h_start, y_patch_h_start+y_patch_height)
+    w_bounds = (y_patch_w_start, y_patch_w_start+y_patch_width)
+    return y_patch, h_bounds, w_bounds
+
+def parse_image_multi(frames):
+    n = frames.shape[0] # should always be 2
+    H = (frames.shape[1]*2)//3 # 128
+    W = frames.shape[2] # 256
+
+    parsed = torch.zeros(size=(n, 6, H//2, W//2)).float()
+
+
+    parsed[:, 0] = frames[:, 0:H:2, 0::2] # even column, even row
+    parsed[:, 1] = frames[:, 1:H:2, 0::2] # odd column, even row
+    parsed[:, 2] = frames[:, 0:H:2, 1::2] # even column, odd row
+    parsed[:, 3] = frames[:, 1:H:2, 1::2] # odd column, even row
+    parsed[:, 4] = frames[:, H:H+H//4].reshape((n, H//2,W//2))
+    parsed[:, 5] = frames[:, H+H//4:H+H//2].reshape((n, H//2,W//2))
+
+    return parsed
+
+# creates and optimizes patch and evaluates its effectiveness, also finds RMSE between models
+def run_patched_comparison(img1_path, img2_path, models, traffic_convention='right', verbose=True, rec_states=None):
+    pred_times = [0, 2, 4, 6, 8, 10]
+    dim = (512, 256)
+    thres = 1
+    mask_iterations = 10
+
+    torch_model, onnx_model, yolo_model = models
+
+    # set up inputs
+    desire = np.zeros(shape=(1, 8)).astype('float32')
+    traffic_convention = np.array([[1, 0]]).astype('float32')
+    if rec_states is None:
+        torch_rec_state = np.zeros(shape=(1, 512)).astype('float32')
+        onnx_rec_state = np.zeros(shape=(1, 512)).astype('float32')
+    else:
+        torch_rec_state, onnx_rec_state = rec_states
+
+
+    # read in images
+    img1 = cv2.imread(img1_path)
+    img2 = cv2.imread(img2_path)
+
+    ### locate and build patch for image 2 ###
+    results = yolo_model(img2, verbose=False)
+    boxes = results[0].boxes
+
+    # choose largest box found
+    max_size = 0
+    for i in range(len(boxes)):
+        box_ = boxes[i].xyxy
+        size = (box_[0, 3] - box_[0, 1])*(box_[0, 2] - box_[0, 0])
+        if size > max_size:
+            box = box_
+            max_size = size
+
+    # if no object found, attack 1 pixel in the center of the image
+    if len(boxes) == 0:
+        box = torch.tensor([[437, 582, 438, 583]])
+
+    if isinstance(box, torch.Tensor):
+        box = box.int().cpu().numpy()
+    else:
+        box = box.astype('int32')
+
+    patch_start = (box[0, 1], box[0, 0])
+    patch_dim = (box[0, 3] - box[0, 1], box[0, 2] - box[0, 0])
+
+    patch, h_bounds, w_bounds = build_yuv_patch(thres, patch_dim, patch_start)
+    patch = torch.tensor(patch, requires_grad=True)
+    adam = AdamOptTorch(patch.shape, lr = 1)
+
+    # convert images to YUV I420
+    img1 = cv2.resize(img1, dim)
+    img2 = cv2.resize(img2, dim)
+    img1_yuv = cv2.cvtColor(img1, cv2.COLOR_BGR2YUV_I420).astype('float32')
+    img2_yuv = cv2.cvtColor(img2, cv2.COLOR_BGR2YUV_I420).astype('float32')
+    proc_images = [img1_yuv, img2_yuv]
+
+    # initial pass through
+    input_imgs = parse_image_multi(torch.tensor(np.array(proc_images))).reshape(1, 12, 128, 256)
+    torch_init_drel, torch_rec_state = estimate_torch(torch_model, input_imgs, desire, traffic_convention, torch_rec_state)
+    onnx_init_drel, onnx_rec_state = estimate_onnx(onnx_model, input_imgs.detach().numpy(), desire, traffic_convention, onnx_rec_state)
+
+    torch_init_drel = [v.detach().numpy() for v in torch_init_drel]
+    init_drel_rmse = np.sqrt(mean_squared_error(torch_init_drel, onnx_init_drel))
+    init_results = (torch_init_drel, onnx_init_drel, init_drel_rmse)
+    print('\t Initial relative distance predictions未加patch的预测结果:', onnx_init_drel[0], "(ONNX),", torch_init_drel[0], "(Torch)")
+
+    ### optimize patch ###
+    for it in range(mask_iterations):
+        # print(it)
+        # apply new patch to the image
+        patch = torch.clip(patch, -thres, thres)
+        tmp_pimgs = torch.tensor(np.array(copy.deepcopy(proc_images))).float()
+        tmp_pimgs[:, h_bounds[0]:h_bounds[1], w_bounds[0]:w_bounds[1]] += patch
+
+        tmp_pimgs = parse_image_multi(tmp_pimgs)
+        input_imgs = tmp_pimgs.reshape(1, 12, 128, 256)
+
+        # pass newly masked image through the model
+        torch_drel, _ = estimate_torch(torch_model, input_imgs, desire, traffic_convention, torch_rec_state)
+
+        if it == 0:
+            print('\t Relative distance prediction with random patch:随机patch的预测结果', torch_drel[0].detach().numpy())
+
+        patch.retain_grad()
+        torch_drel[0].backward(retain_graph=True)
+        grad = patch.grad
+
+        # update patch
+        update = adam.update(grad)
+        patch = patch.clone().detach().requires_grad_(True) + update
+        torch_rec_state = torch_rec_state.clone().detach()
+
+    # create input with optimized patch
+    patch = torch.clip(patch, -thres, thres)
+    tmp_pimgs = torch.tensor(np.array(copy.deepcopy(proc_images))).float()
+    tmp_pimgs[:, h_bounds[0]:h_bounds[1], w_bounds[0]:w_bounds[1]] += patch
+    tmp_pimgs = parse_image_multi(tmp_pimgs)
+    input_imgs = tmp_pimgs.reshape(1, 12, 128, 256)
+
+    ### send patched input through model ###
+    torch_drel, torch_rec_state = estimate_torch(torch_model, input_imgs, desire, traffic_convention, torch_rec_state)
+    torch_drel = [v.detach().numpy() for v in torch_drel]
+    onnx_drel, onnx_rec_state = estimate_onnx(onnx_model, input_imgs.detach().numpy(), desire, traffic_convention, onnx_rec_state)
+
+    if verbose:
+        print('######## PyTorch Output #########')
+        print('攻击后pytorch的距离Lead vehicle relative distance (0, 2, 4, 6, 8, 10) s:', torch_drel)
+        print()
+
+    if verbose:
+        print('######## ONNX Output #########')
+        print('攻击后onnx的距离Lead vehicle relative distance (0, 2, 4, 6, 8, 10) s:', onnx_drel)
+        print()
+
+    drel_rmse = np.sqrt(mean_squared_error(torch_drel, onnx_drel))
+
+    if verbose:
+        print('dRel RMSE:', drel_rmse)
+
+    print('\t 第0个距离的大小Relative distance prediction with optimized patch:', torch_drel[0], '| Patch size:', patch_dim)
+
+    rec_states = (torch_rec_state.clone().detach(), onnx_rec_state)
+    optmask_results = (torch_drel, onnx_drel, drel_rmse)
+    return init_results,  optmask_results, rec_states
+
+# analyze all images (RMSE only)
+def run_comparison_all():
+    with open(RESULTS_PATH, 'a', newline='') as f:
+            writer = csv.writer(f)
+            row = ['Image',
+                   'Torch_dRel0', 'Torch_dRel2', 'Torch_dRel4', 'Torch_dRel6', 'Torch_dRel8', 'Torch_dRel10',
+                   'ONNX_dRel0', 'ONNX_dRel2', 'ONNX_dRel4', 'ONNX_dRel6', 'ONNX_dRel8', 'ONNX_dRel10',
+                   'RMSE']
+            writer.writerow(row)
+
+
+    paths = [p for p in os.listdir(IMGS_DIRECTORY) if p.endswith('.png')]
+
+    rec_states = None
+    for i in range(1, len(paths)):
+        img1_path = os.path.join(IMGS_DIRECTORY, paths[i-1])
+        img2_path = os.path.join(IMGS_DIRECTORY, paths[i])
+
+        torch_drel, onnx_drel, drel_rmse, rec_states = run_comparison(img1_path, img2_path, traffic_convention='right', verbose=False, rec_states=rec_states)
+        print(i, torch_drel[0])
+
+        with open(RESULTS_PATH, 'a', newline='') as f:
+            writer = csv.writer(f)
+            row = [i] + list(torch_drel) + list(onnx_drel) + [drel_rmse]
+            writer.writerow(row)
+
+    print('Done!')
+
+
+# analyze all images
+def run_patched_comparison_all():
+
+    with open(RESULTS_PATH, 'a', newline='') as f:
+            writer = csv.writer(f)
+            row = ['Image',
+                   'Torch_init_dRel0', 'Torch_init_dRel2', 'Torch_init_dRel4', 'Torch_init_dRel6', 'Torch_init_dRel8', 'Torch_init_dRel10',
+                   'Torch_optmask_dRel0', 'Torch_optmask_dRel2', 'Torch_optmask_dRel4', 'Torch_optmask_dRel6', 'Torch_optmask_dRel8', 'Torch_optmask_dRel10',
+                   'ONNX_init_dRel0', 'ONNX_init_dRel2', 'ONNX_init_dRel4', 'ONNX_init_dRel6', 'ONNX_init_dRel8', 'ONNX_init_dRel10',
+                   'ONNX_optmask_dRel0', 'ONNX_optmask_dRel2', 'ONNX_optmask_dRel4', 'ONNX_optmask_dRel6', 'ONNX_optmask_dRel8', 'ONNX_optmask_dRel10',
+                   'RMSE_init', 'RMSE_optmask', 'optmask_drel_effect']
+            writer.writerow(row)
+
+
+    torch_model = load_torch_model(TORCH_WEIGHTS_PATH)
+    onnx_model = onnxruntime.InferenceSession(ONNX_MODEL_PATH)
+    yolo_model = YOLO(YOLO_WEIGHTS_PATH)
+    models = (torch_model, onnx_model, yolo_model)
+
+    paths = [p for p in os.listdir(IMGS_DIRECTORY) if p.endswith('.png')]
+
+    rec_states = None
+    for i in range(1, len(paths)):
+        img1_path = os.path.join(IMGS_DIRECTORY, paths[i-1])
+        img2_path = os.path.join(IMGS_DIRECTORY, paths[i])
+
+        print(f"Analyzing images {i-1} & {i}")
+        init_results,  optmask_results, rec_states = run_patched_comparison(
+            img1_path,
+            img2_path,
+            models,
+            traffic_convention='right',
+            verbose=False,
+            rec_states=rec_states,
+        )
+
+        torch_init_drel, onnx_init_drel, init_drel_rmse = init_results
+        torch_optmask_drel, onnx_optmask_drel, opt_drel_rmse = optmask_results
+
+        optmask_drel_effect = onnx_optmask_drel[0] - onnx_init_drel[0]
+
+        with open(RESULTS_PATH, 'a', newline='') as f:
+            writer = csv.writer(f)
+            row = [i] + list(torch_init_drel) + list(torch_optmask_drel) + list(onnx_init_drel) + list(onnx_optmask_drel) + [init_drel_rmse, opt_drel_rmse, optmask_drel_effect]
+            writer.writerow(row)
+
+    print('Done!')
+
+
+def collect_results():
+    df = pd.read_csv(RESULTS_PATH)
+
+    for t in range(0, 11, 2):
+        error = df['Torch_dRel'+str(t)] - df['ONNX_dRel'+str(t)]
+        rmse = np.sqrt(np.mean(error.pow(2)))
+        print('dRel RMSE for time {}: {}'.format(t, rmse))
+
+
+    bounds = [0, 20, 40, 60, 80, 2147483647]
+    t_cols = ['Torch_dRel'+str(t) for t in range(0, 12, 2)]
+    o_cols = ['ONNX_dRel'+str(t) for t in range(0, 12, 2)]
+
+    for i in range(1, len(bounds)):
+        t_predictions_within_bounds = np.all([df[t_cols] > bounds[i-1], df[t_cols] <= bounds[i]], axis=0) # all entries where estimate is within (L, U]
+        o_predictions_within_bounds = np.all([df[o_cols] > bounds[i-1], df[o_cols] <= bounds[i]], axis=0)
+        if not np.all(t_predictions_within_bounds == o_predictions_within_bounds):
+            print(':( at ', t)
+        t_mask = np.array(df[t_cols]*t_predictions_within_bounds)
+        o_mask = np.array(df[o_cols]*o_predictions_within_bounds)
+        rmse = np.sqrt(np.mean(np.power(o_mask - t_mask, 2)))
+        print('dRel RMSE for estimates within ({}, {}]'.format(bounds[i-1], bounds[i]), rmse)
+
+    rmse = np.mean(df['RMSE'])
+    print('Overall RMSE:', rmse)
+
+def collect_results_patched(col_type='init'):
+    df = pd.read_csv(RESULTS_PATH)
+
+    for t in range(0, 11, 2):
+        error = df[f'Torch_{col_type}_dRel{t}'] - df[f'ONNX_{col_type}_dRel{t}']
+        rmse = np.sqrt(np.mean(error.pow(2)))
+        print('dRel RMSE for time {}: {}'.format(t, rmse))
+
+
+    bounds = [0, 20, 40, 60, 80, 2147483647]
+    t_cols = [f'Torch_{col_type}_dRel{t}' for t in range(0, 12, 2)]
+    o_cols = [f'ONNX_{col_type}_dRel{t}' for t in range(0, 12, 2)]
+
+    for i in range(1, len(bounds)):
+        # t_predictions_within_bounds = np.all([df[t_cols] > bounds[i-1], df[t_cols] <= bounds[i]], axis=0) # all entries where estimate is within (L, U]
+        o_predictions_within_bounds = np.all([df[o_cols] > bounds[i-1], df[o_cols] <= bounds[i]], axis=0)
+        # if not np.all(t_predictions_within_bounds == o_predictions_within_bounds):
+        #     print(':( at ', t)
+        t_mask = np.array(df[t_cols]*o_predictions_within_bounds)
+        o_mask = np.array(df[o_cols]*o_predictions_within_bounds)
+        rmse = np.sqrt(np.mean(np.power(o_mask - t_mask, 2)))
+        print('dRel RMSE for estimates within ({}, {}] :'.format(bounds[i-1], bounds[i]), rmse)
+
+    rmse = np.mean(df[f'RMSE_{col_type}'])
+    print('Overall RMSE:', rmse)
+
+    if col_type == 'optmask':
+        avg_optmask_effect = np.mean(df['optmask_drel_effect'])
+        std_optmask_effect = np.std(df['optmask_drel_effect'])
+        print('Optimized patch\'s effect on relative distance:', avg_optmask_effect, '(mean),', std_optmask_effect, '(std)')
+
+if __name__ == '__main__':
+    results_dir, file_name = os.path.split(RESULTS_PATH)
+    if not os.path.exists(results_dir):
+        os.mkdir(results_dir)
+
+    i = 1
+    while os.path.exists(RESULTS_PATH):
+        file_name = 'image_eval_' + str(i) + '.csv'
+        RESULTS_PATH = os.path.join(results_dir, file_name)
+        i += 1
+
+    print('Writing results to:', RESULTS_PATH)
+    f = open(RESULTS_PATH, "x")
+    f.close()
+
+    run_patched_comparison_all()
+
+    print('### init results ###')
+    collect_results_patched('init')
+    print('### optmask results ###')
+    collect_results_patched('optmask')
+    一样加载模型，还需要对现在的quick_ort_run.py进行修改吗
+
+不需要改——**取决于你接下来要跑哪个模型**：
+
+## 情况 A：你继续按这份脚本跑 `supercombo_server3.onnx`（你贴的这段代码就是为它写的）
+
+* 直接用你这份对比脚本即可：`ONNX_MODEL_PATH = '../models/weights/supercombo_server3.onnx'`
+* 不用 `quick_ort_run.py`，也**不需要**对它做任何修改。
+* server3 版模型的输入就是 `(input_imgs, desire, traffic_convention, initial_state)`，`float32`，你的代码完全对齐。
+
+## 情况 B：你还是想用 `quick_ort_run.py`
+
+`quick_ort_run.py` 是我为\*\*车端 `supercombo.onnx`（fp16 + 多输入）\*\*专门适配的工具。如果你要把它用在 **server3.onnx**，则需要把它切到“server3 模式”（更简单）：
+
+**需要改动点（很小）：**
+
+1. 把 `ONNX_MODEL_PATH` 指向 `supercombo_server3.onnx`。
+2. 在 `make_feed(...)` 里只喂这 4 个输入，且 **dtype=fp32**：
+
+   * `input_imgs: (1,12,128,256) float32`（仍旧 YUV I420 + parse）
+   * `desire: (1,8) float32`（one-hot 第 0 位置 1）
+   * `traffic_convention: (1,2) float32`（右侧通行 `[1,0]`）
+   * `initial_state: (1,512) float32`（首次全 0，之后用上次输出末尾 512 回填）
+     其它 `big_input_imgs / features_buffer / nav_* / prev_desired_curv / lateral_control_params` **全部不要**。
+3. 把 `np.float16` 的强制类型去掉（server3 是 **float32**）。
+4. 输出仍名为 `outputs`，`out[:, -512:]` 是下一步的隐状态，这与您原始对比脚本一致。
+
+> 如果你愿意，我可以把一份“server3 模式”的 `quick_ort_run_server3.py` 最小版本贴给你，但从你的目标看，用你当前这份对比脚本就足够了。
+
+---
+
+### 小结
+
+* **跑 server3.onnx**：用你现在这份（带 PyTorch 对比 + 攻击）的脚本即可，**不需要**动 `quick_ort_run.py`。
+* **跑 supercombo.onnx**：用 `quick_ort_run.py`（fp16 + 多输入）；
+* **把 quick\_ort\_run.py 用于 server3.onnx**：需要把输入改回 4 个 + float32（上面列的 4 点小改）。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+supercombo带不带server3有什么区别？quick_ort_run.py对onnx做了什么修改？
+下面把两个点说清楚：
+
+# supercombo vs. supercombo\_server3 的区别（核心要点）
+
+可以把 **`supercombo.onnx`** 理解为**车端模型图**，而 **`supercombo_server3.onnx`** 是**为服务器/评测适配过的导出版本**。典型差异如下：
+
+| 维度       | supercombo.onnx（车端）                                                                                                                                                                                                  | supercombo\_server3.onnx（评测/ORT 友好）                                                              |
+| -------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| 主要用途     | 车端实时推理（配合 ModelRunner/Thneed/OpenCL）                                                                                                                                                                                 | 离线评测/服务器推理（ONNX Runtime 友好）                                                                      |
+| 输入 dtype | **float16**                                                                                                                                                                                                          | **float32**                                                                                      |
+| 输入张量     | 多输入：`input_imgs`、`big_input_imgs`、`desire(1,100,8)`、`traffic_convention(1,2)`、`lateral_control_params(1,2)`、`prev_desired_curv(1,100,1)`、`nav_features(1,256)`、`nav_instructions(1,150)`、`features_buffer(1,99,512)` | 精简 4 个：`input_imgs(1,12,128,256)`、`desire(1,8)`、`traffic_convention(1,2)`、`initial_state(1,512)` |
+| 历史/递归    | 通过 **多路历史缓冲**（`features_buffer` 等）传入                                                                                                                                                                                 | 仅通过 **`initial_state`** 回传-喂回                                                                    |
+| 输出形态     | 常见为 fp16，拼接向量长度可能不同（你那份是 6504）                                                                                                                                                                                       | fp32，拼接向量；末尾 512 为下一步隐状态                                                                         |
+| ORT 兼容性  | 可能有算子/常量折叠在 ORT-CPU 上不稳定                                                                                                                                                                                             | 为 ORT 适配过，直接可跑                                                                                   |
+| 前处理一致性   | 图像前处理一致（YUV I420 + parse）                                                                                                                                                                                            | 同左                                                                                               |
+
+**一句话**：`server3` 是把车端复杂多输入、fp16、历史缓冲的图**裁剪/改造**成了更容易在 ORT 上用单批次、fp32、少输入就能推的版本，因此你的对比/攻击脚本是为 `server3` 写的，能直接跑。
+
+---
+
+# quick\_ort\_run.py 对 onnx 做了什么修改？
+
+**默认情况下：它不会修改你的 onnx 文件。**
+
+* 它做的是**运行时适配**：
+
+  * 正确设置 ORT 选项（关闭图优化）、
+  * 按模型实际 **输入名/形状/dtype** 构造输入（对 `supercombo.onnx` 用 fp16、多输入）、
+  * 解析输出。
+* 只有当**加载失败**时，它才会**可选地调用 onnx-simplifier** 在本地生成一个**简化后的临时副本**（例如 `/tmp/supercombo_simplified_*.onnx`），再用**这个副本**加载运行。原始 `supercombo.onnx` 不会被覆盖。
+* 你前面的成功日志中**没有**出现“简化完成 -> …”的提示，且 `build ORT session:` 指向的仍是 `../models/weights/supercombo.onnx`，说明这次运行**没有对 onnx 做离线改写**，只是做了**输入/会话层面的适配**。
+
+---
+
+# 该用哪个？
+
+* **做 Torch vs ONNX 一致性、对抗 patch、RMSE 统计** → 用 **`supercombo_server3.onnx`**（你的现有脚本已经对齐它的输入逻辑与切片）。
+* **想直接离线跑原始车端图** → 用 `quick_ort_run.py`（fp16 + 多输入）；若 ORT 加载不稳，再启用简化（不会改原文件）。
+* **需要与车端完全一致的行为**（含 Parser/反归一化/历史滚动的真实逻辑） → 走 openpilot 的 **ModelRunner** 路线，而不是 ORT。
+
+
+
+
+
+
+
+
+
+
+
+
+
+现有的supercombo_server3.onnx和quick_ort_run.py里面的supercombo模型不是一个版本，做 Torch vs ONNX 一致性、对抗 patch、RMSE 统计 时我没法直接用现有的supercombo_server3.onnx，我想用quick_ort_run.py里面的supercombo模型
+
+明白：你现在要把**你那份 Torch vs ONNX/对抗补丁/RMSE 的评测脚本**从适配 `supercombo_server3.onnx`（评测版）切到 \*\*`quick_ort_run.py` 里用的 `supercombo.onnx`（车端版）\*\*来跑。
+这需要把脚本里的 **输入/状态管理/数据类型** 全部对齐车端版的接口（fp16 + 多输入 + 历史缓冲），并替换掉原先的 `initial_state` 逻辑。
+
+下面给你一套“**最小修改补丁**”（直接复制到你的脚本里即可）：
+
+---
+
+# 你要做的改动概览
+
+1. 新增一个开关：
+
+```python
+USE_CAR_MODEL = True  # True 表示使用 supercombo.onnx（车端版），False 表示 server3.onnx（老逻辑）
+```
+
+2. 当 `USE_CAR_MODEL=True` 时：
+
+* 所有 ONNX 输入用 **fp16**；
+* 喂 **9 个输入**：`input_imgs, big_input_imgs, desire(1,100,8), traffic_convention(1,2), lateral_control_params(1,2), prev_desired_curv(1,100,1), nav_features(1,256), nav_instructions(1,150), features_buffer(1,99,512)`；
+* 不再用 `initial_state`；改用 `features_buffer` 作为历史“隐状态”缓冲（并在每次推理后**滚动填充**为下一次输入）；
+* 从 `outputs` 末尾取 **512** 维当作“最新隐藏状态”，回填到 `features_buffer` 的**最后一帧**；
+* 输出解析（`lead` 切片）沿用你现在的做法，**强烈建议**从一个 `pkl` 里读（你前面已有 `supercombo_output_map.pkl`），否则默认 `5755:6010` + `stride=51`。
+
+3. Torch 侧：你现在的 `OpenPilotModel`（和 `supercombo_torch_weights.pth`）**大概率是 server3 架构**，与车端版不完全一致。如果你**没有**车端版的同构 Torch 权重，**就只能做 ONNX 单模态对比**（比如“未经 patch 与经 patch 的对比”，或“当前帧与下一帧”等），**不能**做严格的 Torch vs ONNX RMSE。
+
+> 如果你确实有车端同构的 Torch 权重，可以保留 Torch 路径；否则，建议：当 `USE_CAR_MODEL=True` 时，把 Torch 分支短路（只跑 ONNX），下方我也给了“仅 ONNX 跑通”的写法。
+
+---
+
+# 代码补丁（直接贴到你的脚本里）
+
+## A) 顶部：开关 + pkl 读取 + ORT 会话
+
+```python
+# ==== 开关：切到车端模型 ====
+USE_CAR_MODEL = True  # True -> 使用 supercombo.onnx；False -> 使用 server3.onnx（老逻辑保留）
+
+# ==== 如果用车端模型，建议用 pkl 读取输出切片信息 ====
+OUTPUT_MAP_PKL = '../models/weights/supercombo_output_map.pkl'
+
+def load_output_layout(pkl_path: str):
+    layout = {}
+    if pkl_path and os.path.exists(pkl_path):
+        import pickle
+        with open(pkl_path, 'rb') as f:
+            try:
+                obj = pickle.load(f)
+            except Exception:
+                obj = {}
+        for k in ['lead_start', 'lead_len', 'lead_stride', 'lead_prob_base', 'rec_state_size']:
+            if k in obj: layout[k] = int(obj[k])
+        if ('lead_start' not in layout or 'lead_len' not in layout) and 'heads' in obj:
+            off = 0
+            for h in obj['heads']:
+                n = h.get('name'); ln = h.get('len') or h.get('length') or h.get('size')
+                if n == 'lead' and ln is not None: layout['lead_start'], layout['lead_len'] = off, int(ln); break
+                if ln is not None: off += int(ln)
+        if 'rec_state_size' not in layout and isinstance(obj.get('recurrent_state'), dict):
+            rs = obj['recurrent_state'].get('size') or obj['recurrent_state'].get('len')
+            if rs is not None: layout['rec_state_size'] = int(rs)
+
+    layout.setdefault('lead_start', 5755)
+    layout.setdefault('lead_len',   255)
+    layout.setdefault('lead_stride', 51)
+    layout.setdefault('lead_prob_base', 48)
+    layout.setdefault('rec_state_size', 512)
+    return layout
+
+# ==== ORT 会话（关优化，CPU 更稳）====
+def build_ort_session(onnx_path: str):
+    import onnxruntime as ort
+    so = ort.SessionOptions()
+    so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    so.enable_mem_pattern = False
+    so.enable_cpu_mem_arena = True
+    return ort.InferenceSession(onnx_path, sess_options=so, providers=["CPUExecutionProvider"])
+```
+
+## B) 前处理：当用车端模型时改为 fp16
+
+把你原来的 `prepare_input(...)` 改成能同时支持两种模式：
+
+```python
+def prepare_input(img1_path, img2_path, traffic_convention='right'):
+    img1 = read_image(img1_path)
+    img2 = read_image(img2_path)
+    input_imgs = np.r_[img1, img2][np.newaxis, ...]
+
+    if USE_CAR_MODEL:
+        # 车端模型：fp16，后面会构造多输入，这里仅返回图像
+        input_imgs = input_imgs.astype(np.float16)
+        # desire/traffic/initial_state 在 car 模式不在这里组装
+        return input_imgs, None, None, None
+    else:
+        # server3：fp32 + 4 输入
+        desire = np.zeros(shape=(1, 8), dtype=np.float32)
+        desire[0, 0] = 1.0
+        if traffic_convention == 'left':
+            traffic_convention = np.array([[0, 1]], dtype=np.float32)
+        else:
+            traffic_convention = np.array([[1, 0]], dtype=np.float32)
+        recurrent_state = np.zeros(shape=(1, 512), dtype=np.float32)
+        return input_imgs.astype(np.float32), desire, traffic_convention, recurrent_state
+```
+
+## C) 车端模型的 feed 构造 + 输出解析 + 历史滚动
+
+新增以下函数（不影响旧逻辑）：
+
+```python
+# 已知车端模型的输入名：
+CAR_KNOWN_INPUTS = [
+    'input_imgs','big_input_imgs','desire','traffic_convention',
+    'lateral_control_params','prev_desired_curv','nav_features',
+    'nav_instructions','features_buffer'
+]
+
+def _decl_shape(session, name):
+    for inp in session.get_inputs():
+        if inp.name == name:
+            shp = [(1 if (s in (None,'None') or s == -1 or isinstance(s,str)) else int(s)) for s in inp.shape]
+            return shp
+    return None
+
+def make_car_feed(session, input_imgs, traffic='right', car_state=None):
+    """
+    根据车端 onnx 的真实形状声明构造喂入（全部 fp16）
+    car_state: 持久化历史缓存，形如：
+      {
+        'features_buffer': (1,99,512) fp16,
+        'prev_desired_curv': (1,100,1) fp16,
+        'nav_features': (1,256) fp16,
+        'nav_instructions': (1,150) fp16
+      }
+    """
+    feed = {}
+    # 1) input_imgs
+    shp = _decl_shape(session, 'input_imgs')
+    if shp is None: raise RuntimeError("车端模型缺少 input_imgs")
+    if list(input_imgs.shape) != shp:
+        raise ValueError(f"input_imgs shape mismatch: expect {shp}, got {input_imgs.shape}")
+    feed['input_imgs'] = input_imgs.astype(np.float16)
+
+    # 2) big_input_imgs：给零（或复制相同图像都可以）
+    shp = _decl_shape(session, 'big_input_imgs')
+    if shp is not None:
+        feed['big_input_imgs'] = np.zeros(shp, dtype=np.float16)
+
+    # 3) desire: (1,100,8)，最后一帧 one-hot 第0类
+    shp = _decl_shape(session, 'desire')
+    if shp is not None:
+        arr = np.zeros(shp, dtype=np.float16)
+        if len(shp)==3 and shp[-1]>=8:
+            arr[0, -1, 0] = np.float16(1.0)
+        feed['desire'] = arr
+
+    # 4) traffic_convention: (1,2)
+    shp = _decl_shape(session, 'traffic_convention')
+    if shp is not None:
+        arr = np.zeros(shp, dtype=np.float16)
+        if shp[-1]==2:
+            if traffic.lower()=='left': arr[0,1]=np.float16(1.0)
+            else:                       arr[0,0]=np.float16(1.0)
+        feed['traffic_convention'] = arr
+
+    # 5) lateral_control_params: (1,2) 离线置零
+    shp = _decl_shape(session, 'lateral_control_params')
+    if shp is not None:
+        feed['lateral_control_params'] = np.zeros(shp, dtype=np.float16)
+
+    # 6~9) 历史/导航：优先用 car_state，缺少就置零
+    def _get(name, dtype=np.float16):
+        shp = _decl_shape(session, name)
+        if shp is None: return None
+        if car_state and (name in car_state) and (car_state[name].shape==tuple(shp)):
+            return car_state[name].astype(dtype)
+        return np.zeros(shp, dtype=dtype)
+
+    for name in ['prev_desired_curv','features_buffer','nav_features','nav_instructions']:
+        arr = _get(name)
+        if arr is not None: feed[name] = arr
+    return feed
+
+def parse_outputs_to_drel_car(out_vec: np.ndarray, layout: dict):
+    # 输出是 fp16，先转 fp32 计算
+    out_vec = out_vec.astype(np.float32)
+    lead_start   = layout['lead_start']
+    lead_len     = layout['lead_len']
+    stride       = layout['lead_stride']
+    prob_base    = layout['lead_prob_base']
+    rec_size     = layout['rec_state_size']
+
+    lead = out_vec[0, lead_start: lead_start + lead_len]
+    drel = []
+    for t in range(6):
+        x_predt = lead[4*t::stride]
+        if t < 3:
+            prob = lead[prob_base + t::stride]
+            drel.append(float(x_predt[np.argmax(prob)]))
+        else:
+            drel.append(float(np.mean(x_predt)))
+    rec_state = out_vec[:, -rec_size:]
+    return drel, rec_state  # rec_state: (1,512) fp32
+```
+
+**历史滚动（关键！）**：每次推理后把 `rec_state` 回填进 `features_buffer` 最后一帧，形成滚动历史。你可以在 `run_comparison` / `run_patched_comparison` 里这样维护一个 `car_state` 字典：
+
+```python
+# 车端历史状态缓存（在外层 init 一份并传下去）
+car_state = {
+    'features_buffer': np.zeros((1,99,512), dtype=np.float16),
+    'prev_desired_curv': np.zeros((1,100,1), dtype=np.float16),
+    'nav_features': np.zeros((1,256), dtype=np.float16),
+    'nav_instructions': np.zeros((1,150), dtype=np.float16),
+}
+layout = load_output_layout(OUTPUT_MAP_PKL)  # 只需一次
+session = build_ort_session(ONNX_MODEL_PATH) # 只需一次
+out_name = session.get_outputs()[0].name     # 一般是 'outputs'
+```
+
+在每次 `estimate_onnx` 中（新增一个专用于车端的函数），完成喂入与滚动：
+
+```python
+def estimate_onnx_car(session, layout, input_imgs, traffic, car_state):
+    feed = make_car_feed(session, input_imgs, traffic=traffic, car_state=car_state)
+    y = session.run([session.get_outputs()[0].name], feed)
+    out_vec = np.array(y[0])  # (1, N) fp16
+    drel, rec_state = parse_outputs_to_drel_car(out_vec, layout)  # rec_state fp32
+
+    # === 滚动 features_buffer（把最新 512 维放到最后一帧）===
+    fb = car_state.get('features_buffer', None)
+    if fb is not None and fb.shape == (1,99,512):
+        fb[:, :-1, :] = fb[:, 1:, :]
+        fb[:, -1,  :] = rec_state.astype(np.float16)
+        car_state['features_buffer'] = fb
+    return drel, car_state
+```
+
+## D) 在你的 `run_comparison` / `run_patched_comparison` 里分支
+
+把原有的 `run_comparison(...)` 中 ONNX 推理一段替换为分支逻辑（**Torch 部分如果没有车端同构权重，建议直接跳过或设为 None**）：
+
+```python
+def run_comparison(img1_path, img2_path, traffic_convention='right', verbose=True, rec_states=None):
+    if not USE_CAR_MODEL:
+        # === 原 server3 流程（保持不变）===
+        torch_model = load_torch_model(TORCH_WEIGHTS_PATH)
+        onnx_model = onnxruntime.InferenceSession(ONNX_MODEL_PATH)
+        input_imgs, desire, traffic_convention, recurrent_state0 = prepare_input(img1_path, img2_path, traffic_convention)
+        if rec_states is None:
+            torch_rec_state = recurrent_state0
+            onnx_rec_state = recurrent_state0
+        else:
+            torch_rec_state, onnx_rec_state = rec_states
+        torch_drel, torch_rec_state = estimate_torch(torch_model, input_imgs, desire, traffic_convention, torch_rec_state)
+        torch_drel = [v.detach().numpy() for v in torch_drel]
+        onnx_drel, onnx_rec_state = estimate_onnx(onnx_model, input_imgs, desire, traffic_convention, onnx_rec_state)
+        drel_rmse = np.sqrt(mean_squared_error(torch_drel, onnx_drel))
+        return torch_drel, onnx_drel, drel_rmse, (torch_rec_state, onnx_rec_state)
+
+    else:
+        # === 车端 supercombo.onnx 流程（ONNX-only）===
+        session = build_ort_session(ONNX_MODEL_PATH)
+        layout = load_output_layout(OUTPUT_MAP_PKL)
+        # 初始化车端历史缓存（可外部复用，这里给最简内部版本）
+        car_state = {
+            'features_buffer': np.zeros((1,99,512), dtype=np.float16),
+            'prev_desired_curv': np.zeros((1,100,1), dtype=np.float16),
+            'nav_features': np.zeros((1,256), dtype=np.float16),
+            'nav_instructions': np.zeros((1,150), dtype=np.float16),
+        }
+        # 准备图像（fp16）
+        input_imgs, _, _, _ = prepare_input(img1_path, img2_path, traffic_convention)
+        onnx_drel, car_state = estimate_onnx_car(session, layout, input_imgs, traffic_convention, car_state)
+
+        # 没有同构 Torch 权重时，返回 ONNX 结果，Torch 用 None
+        torch_drel = None
+        drel_rmse = None
+        return torch_drel, onnx_drel, drel_rmse, car_state
+```
+
+`run_patched_comparison(...)` 的 ONNX 侧也同理：
+
+* 将 `input_imgs` 的 numpy 传入 `estimate_onnx_car(...)`；
+* 维持同一个 `car_state`（在循环外创建一次，循环内传入/返回）；
+* Torch 分支按需保留或关闭。
+
+**提示**：你做对抗 patch 时，车端模型需要 fp16 输入。你的对抗 patch流程里 `tmp_pimgs` 是 `float32` 的 torch 张量；最终送 ORT 前用 `.numpy().astype(np.float16)` 即可。
+
+---
+
+# 常见问题
+
+* **为什么 dRel 还可能很怪？**
+  因为车端版的完整“解析/反归一化”通常由 `Parser`/图内 denorm 完成。我们按固定切片取 `lead` 能用，但**不是车端口径的最终物理值**。想完全一致，需把 openpilot 的 `Parser` 接进来解析（如果你环境能 import openpilot 的模块，我可以给你一段接 Parser 的代码）。
+
+* **Torch vs ONNX 的 RMSE 还能算吗？**
+  如果你没有**车端同构**的 Torch 权重（而是 server3 的权重），那 RMSE 就没法有意义地比了。建议在车端路径下改成 **“ONNX（未加补丁） vs ONNX（加补丁）”** 的 delta/差异统计；或只用车端 ONNX 做攻击评估。
+
+---
+
+# 最后一句话
+
+* 你要用 `quick_ort_run.py` 的 **supercombo.onnx（车端版）** 来跑你这份评测脚本，就按上面的补丁走：**fp16 + 多输入 + features\_buffer 历史滚动**，去掉 `initial_state`；Torch 侧若无同构权重就先关掉，仅做 ONNX 路线的评估与对抗。
+* 如果你后续需要“**接入 Parser，保证数值口径与车端一致**”，告诉我，我把那部分也补上。
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+现在的quick_ort_run.py 里面的onnx是车端实时推理（配合 ModelRunner/Thneed/OpenCL）还是离线评测/服务器推理（ONNX Runtime 友好）
+
+结论先说：**`quick_ort_run.py` 里用的 `supercombo.onnx` 是“车端模型图”，但被我们用 ONNX Runtime 做“离线评测/推理”。**
+它不是走车上的 ModelRunner/Thneed/OpenCL 执行路径；只是把车端那份 onnx 用 ORT 在本机离线跑起来了。
+
+快速要点👇
+
+* **模型身份**：`supercombo.onnx` = 车端图
+
+  * fp16 精度、**多输入**（`big_input_imgs、desire[1,100,8]、features_buffer[1,99,512] …`）、依赖历史缓冲 —— 这些都是车端特征。
+  * 与为 ORT 精简过的 `supercombo_server3.onnx`（fp32、4 输入、`initial_state`）不同。
+
+* **运行方式**：`quick_ort_run.py` = **离线 ORT 推理**
+
+  * 不用 ModelRunner/Thneed/OpenCL；
+  * 通过关闭 ORT 图优化 + 按模型声明喂 **fp16 多输入**，让 ORT 能加载并执行这份车端 onnx；
+  * 仅在加载失败时，才可选调用 onnx-simplifier 生成**简化副本**再跑；原始 onnx 不会被改写。
+
+* **影响**：
+
+  * 这是“**车端模型 + ORT 离线执行**”的组合，数值口径接近车端，但**不等于**车端全流程（车端还有 Parser/denorm、精确的历史滚动、OpenCL 量化/内核差异等）；
+  * 若要**与车上一模一样的行为**，应走 ModelRunner 路线；
+  * 若只要在本机做**离线评测/对抗实验**，`quick_ort_run.py` 的做法就合适。
+
+一句话定位：**它用的是车端 onnx，但执行方式是 ORT 离线评测。**
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+那我想要做Torch vs ONNX/对抗补丁/RMSE 的评测的话是否需要把车端的onnx换成与为 ORT 精简过的 supercombo_server3.onnx（fp32、4 输入、initial_state）相同的？还是直接车端模型 + ORT 离线执行这样就行？
+
+结论先说：
+
+* **要做 “Torch vs ONNX 一致性 + 对抗补丁 + RMSE”** 这类**对齐评测**，**最好用成对的同构模型**。也就是：你手里的 **Torch 模型/权重** 和 **ONNX 模型** 必须来自**同一导出口径**。
+  ➜ 在你当前条件下，**优先用 `supercombo_server3.onnx`**（fp32、4 个输入、`initial_state`），因为你的 PyTorch 模型（`OpenPilotModel` + `supercombo_torch_weights.pth`）就是按这个口径写的。这样**输入接口一致**、**隐藏状态传递一致**、**精度/切片一致**，RMSE 才有意义。
+
+* **直接“车端模型 + ORT 离线执行”**当然可以跑**对抗补丁**，也可以做**ONNX 内部的前后对比**（例如 patch 前/后 RMSE、dRel 变化），但**不能**做严格的 Torch vs ONNX RMSE，除非你也有**车端口径的 PyTorch 同构权重**（而你现在没有）。
+
+---
+
+## 为什么要用同构口径（server3）来做 Torch vs ONNX？
+
+两者在这些方面差异很大，混用会让 RMSE 失真：
+
+* **输入接口**：server3 = 4 输入（`input_imgs/desire/traffic_convention/initial_state`）；车端 = 多输入 + 历史缓冲（`features_buffer/prev_desired_curv/...`）。
+* **精度**：server3 通常 fp32；车端 fp16。
+* **状态传递**：server3 用 `initial_state (1,512)`；车端用 `features_buffer (1,99,512)` 等历史序列。
+* **输出拼接**：长度、切片位置可能不同（你用 pkl 已解决，但两版未必完全一致）。
+
+只要任一项不一致，Torch 与 ONNX 就不是在“同一个模型”上比较，RMSE 就没有统计意义。
+
+---
+
+## 你可以怎么选
+
+### 方案 A（推荐）：**用 server3 成对评测（Torch vs ONNX）**
+
+保持你现有脚本不变：
+
+* `ONNX_MODEL_PATH = '../models/weights/supercombo_server3.onnx'`
+* 继续按 `(input_imgs, desire, traffic_convention, initial_state)`（fp32）喂；
+* 你已有的切片与隐状态回传逻辑（`out[:,-512:]`）完全对齐；
+* 这样 Torch vs ONNX 的 RMSE、对抗补丁前后 RMSE 都是**可比的**。
+
+### 方案 B：**坚持用车端 onnx + ORT 离线执行**
+
+适合做 **ONNX-only** 的对抗评测和消融，不做 Torch vs ONNX 对齐：
+
+* 把脚本切换为 **fp16 + 多输入**，按 `quick_ort_run.py` 的喂法；
+* 去掉 Torch 分支（或保留为 `None`），只做 **patch 前/后** 的 dRel 差值、RMSE（可用 “未加补丁 vs 加补丁” 作为 RMSE 的两列）；
+* 为了更稳，**滚动 `features_buffer`**：每次推理从 `outputs` 末尾取 512 维，填到 `features_buffer` 最后一帧。
+* 若想更接近车端“物理量”，把 openpilot 的 `Parser` 接进来解析（这样不再用手写切片做 dRel）。
+
+### 方案 C：**想在车端口径也做 Torch vs ONNX**
+
+只有两条路：
+
+1. 拿到 **车端同构的 PyTorch 模型与权重**；或
+2. 反向把车端 onnx **导出同构的 fp32/server 风格**（本质上是做一次“server3 化”），从而与现有 Torch 对上口径。
+   这两条都比方案 A 难不少。
+
+---
+
+## 快速清单（怎么落地）
+
+* **你要 Torch vs ONNX + 对抗 + RMSE：**
+  用 `supercombo_server3.onnx`（你当前脚本已适配）✅
+
+* **你要用车端 onnx 做对抗实验：**
+  用 `quick_ort_run.py` 的喂法（fp16 多输入 + features\_buffer 滚动），**删掉 Torch 对比**，做 ONNX 内部前后对比即可。
+
+如果你决定走“车端 onnx + 对抗”，我可以把你那份对抗脚本改成 **车端模式的最小可运行版**（fp16 多输入、features\_buffer 滚动、仅 ONNX 路线、保存 patch 前后指标）。
+
+
+
+
+
+
+
+
+
+
+
+为什么我从supercombo_server3.onnx换成supercombo.onnx（复杂版）就会报错2025-10-02 16:21:18.818376421 [W:onnxruntime:, constant_folding.cc:179 ApplyImpl] Could not find a CPU kernel and hence can't constant fold Tile node '/action_block/action_denorm/Tile_1'
+2025-10-02 16:21:18.818421565 [W:onnxruntime:, constant_folding.cc:179 ApplyImpl] Could not find a CPU kernel and hence can't constant fold Tile node '/action_block/action_denorm/Tile'
+2025-10-02 16:21:18.821421170 [W:onnxruntime:, constant_folding.cc:179 ApplyImpl] Could not find a CPU kernel and hence can't constant fold Tile node '/action_block/action_denorm/Tile_1'
+2025-10-02 16:21:18.821433572 [W:onnxruntime:, constant_folding.cc:179 ApplyImpl] Could not find a CPU kernel and hence can't constant fold Tile node '/action_block/action_denorm/Tile'
+段错误 (核心已转储)
+？
+
+这个问题有多个层面的原因，让我详细分析：
+
+## 根本原因分析
+
+### 1. **模型结构差异**
+```python
+# supercombo_server3.onnx (简化版)
+输入: 4个简单张量
+输出: 固定结构，便于硬编码解析
+优化: 可能已经移除了有问题的操作
+
+# supercombo.onnx (复杂版)
+输入: 8个复杂张量，包括历史状态
+输出: 需要metadata解析的复杂结构
+优化: 包含有问题的Tile操作节点
+```
+
+### 2. **Tile操作符问题**
+错误信息显示：
+```
+Could not find a CPU kernel and hence can't constant fold Tile node
+```
+- **Tile操作**：用于数据复制/扩展的操作符
+- **常量折叠**：ONNX Runtime试图在编译时预先计算这个操作
+- **缺少CPU内核**：您的ONNX Runtime版本缺少对应的CPU实现
+
+### 3. **输入接口不匹配**
+您的代码可能还在使用简化版的输入接口：
+
+```python
+# 您的代码可能这样调用（简化版接口）
+inputs = {
+    'input_imgs': input_imgs,
+    'desire': desire,
+    'traffic_convention': traffic_convention,
+    'initial_state': recurrent_state  # 错误：复杂版需要更多输入
+}
+
+# 但复杂版需要：
+inputs = {
+    'input_imgs': input_imgs,
+    'big_input_imgs': big_input_imgs,  # 缺少这个
+    'desire': state.inputs['desire'],  # 复杂的状态管理
+    'traffic_convention': state.inputs['traffic_convention'],
+    'lateral_control_params': state.inputs['lateral_control_params'],  # 缺少
+    'prev_desired_curv': state.inputs['prev_desired_curv'],  # 缺少
+    'nav_features': state.inputs['nav_features'],  # 缺少
+    'nav_instructions': state.inputs['nav_instructions'],  # 缺少
+    'features_buffer': state.inputs['features_buffer']  # 缺少
+}
+```
+
+## 解决方案
+
+### 方案1：修复输入接口（推荐）
+```python
+def run_complex_model_comparison(img1_path, img2_path, traffic_convention='right', verbose=True, states=None):
+    # 使用复杂版所需的完整输入接口
+    torch_model = load_torch_model(TORCH_WEIGHTS_PATH)
+    onnx_model = build_session(ONNX_MODEL_PATH)  # 使用保守配置
+    output_slices = load_metadata(METADATA_PATH)
+
+    # 准备复杂版输入
+    input_imgs = read_image(img1_path)[np.newaxis, ...]
+    big_input_imgs = read_image(img2_path)[np.newaxis, ...]  # 第二个摄像头输入
+    current_inputs = prepare_current_inputs(traffic_convention)
+
+    if states is None:
+        torch_state = ModelStateOffline()
+        onnx_state = ModelStateOffline()
+    else:
+        torch_state, onnx_state = states
+
+    # 使用复杂版的推理函数
+    torch_drel, torch_state = estimate_torch_complex(torch_model, input_imgs, big_input_imgs, current_inputs, torch_state, output_slices)
+    onnx_drel, onnx_state = estimate_onnx_complex(onnx_model, input_imgs, big_input_imgs, current_inputs, onnx_state, output_slices)
+
+    return torch_drel, onnx_drel, drel_rmse, (torch_state, onnx_state)
+```
+
+### 方案2：使用模型修补
+```python
+def patch_onnx_model(input_path, output_path):
+    """移除有问题的Tile节点"""
+    import onnx
+    from onnx import version_converter
+
+    model = onnx.load(input_path)
+
+    # 查找并移除有问题的Tile节点
+    nodes_to_remove = []
+    for i, node in enumerate(model.graph.node):
+        if 'Tile' in node.name and 'action_denorm' in node.name:
+            nodes_to_remove.append(i)
+            print(f"标记要移除的节点: {node.name}")
+
+    # 反向移除避免索引问题
+    for i in sorted(nodes_to_remove, reverse=True):
+        del model.graph.node[i]
+
+    onnx.save(model, output_path)
+    return output_path
+
+# 使用修补后的模型
+patched_model_path = patch_onnx_model("supercombo.onnx", "supercombo_patched.onnx")
+onnx_model = build_session(patched_model_path)
+```
+
+### 方案3：升级ONNX Runtime
+```bash
+# 升级到最新版本，可能已经修复Tile操作符支持
+pip install --upgrade onnxruntime
+
+# 或者安装GPU版本（如果有GPU）
+pip install onnxruntime-gpu
+```
+
+### 方案4：使用简化接口包装复杂模型
+```python
+class ComplexModelWrapper:
+    def __init__(self, model_path):
+        self.session = build_session(model_path)
+        self.state = ModelStateOffline()
+        self.output_slices = load_metadata(METADATA_PATH)
+
+    def predict(self, input_imgs, big_input_imgs, current_inputs):
+        """提供简化接口，内部处理复杂状态管理"""
+        self.state.update_inputs(current_inputs)
+
+        input_dict = self.state.inputs.copy()
+        input_dict['input_imgs'] = input_imgs.astype(np.float32)
+        input_dict['big_input_imgs'] = big_input_imgs.astype(np.float32)
+
+        out = self.session.run(['outputs'], input_dict)
+        out = np.array(out[0])[0]
+
+        # 解析输出
+        lead = out[self.output_slices['lead']]
+        drel = []
+        for t in range(6):
+            x_predt = lead[4 * t::51]
+            if t < 3:
+                prob = lead[48 + t::51]
+                current_most_likely_hypo = np.argmax(prob)
+                drelt = x_predt[current_most_likely_hypo]
+            else:
+                drelt = np.mean(x_predt)
+            drel.append(drelt)
+
+        self.state.update_after_run(out, self.output_slices)
+        return drel
+
+# 使用包装器
+model_wrapper = ComplexModelWrapper("supercombo.onnx")
+drel = model_wrapper.predict(input_imgs, big_input_imgs, current_inputs)
+```
+
+## 立即验证步骤
+
+先检查您的代码是否提供了所有必需输入：
+
+```python
+def check_model_inputs():
+    onnx_model = build_session("supercombo.onnx")
+    inputs = onnx_model.get_inputs()
+
+    print("复杂版模型需要的输入:")
+    for inp in inputs:
+        print(f"  {inp.name}: {inp.shape} ({inp.type})")
+
+    # 对比您的实际输入
+    your_inputs = ['input_imgs', 'desire', 'traffic_convention', 'initial_state']  # 简化版输入
+    required_inputs = [inp.name for inp in inputs]
+
+    missing = set(required_inputs) - set(your_inputs)
+    if missing:
+        print(f"缺少的输入: {missing}")
+        return False
+    return True
+
+check_model_inputs()
+```
+
+## 总结
+
+**主要原因**：
+1. 输入接口不匹配（8个vs4个输入）
+2. 复杂模型包含有问题的Tile操作
+3. ONNX Runtime版本可能过旧
+
+**推荐解决方案**：
+1. **首先修复输入接口**，确保提供所有8个必需输入
+2. 如果仍有问题，使用`build_session`的保守配置
+3. 考虑升级ONNX Runtime或使用模型修补
+
+您应该先确保输入接口正确，这是最可能的原因。
