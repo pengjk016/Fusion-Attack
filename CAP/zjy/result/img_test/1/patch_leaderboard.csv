@@ -1,3 +1,0 @@
-Rank,Patch_Name,Mean_Diff,Median_Diff,Std_Diff,Max_Drop,Score
-1,55_patch.npy,-0.1921,-0.1875,0.3096,-1.4062,0.1921
-2,patch.npy,-0.0325,0.0000,0.4231,-1.9844,0.0325
