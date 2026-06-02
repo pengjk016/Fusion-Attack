@@ -169,7 +169,6 @@ def get_RadarState_from_vision(lead_msg: capnp._DynamicStructReader, v_ego: floa
 def get_lead(v_ego: float, ready: bool, tracks: Dict[int, Track], lead_msg: capnp._DynamicStructReader,
              model_v_ego: float, low_speed_override: bool = True) -> Dict[str, Any]:
   # Determine leads, this is where the essential logic happens
-  print(f'tracks的长度是{len(tracks)},概率{lead_msg.prob}')
   if len(tracks) > 0 and ready and lead_msg.prob > .5:
     track = match_vision_to_track(v_ego, lead_msg, tracks)
   else:
@@ -212,8 +211,8 @@ class RadarD:
     self.ready = False
 
     self.cnt = 0
-    self.csv_file = 'radar_log.csv'  # CSV文件名
-    self._init_csv()  # 初始化CSV文件（写入表头）
+    self.csv_file = 'radar_log.csv'  
+    self._init_csv() 
 
     import zmq
     self.zmq_context = zmq.Context()
@@ -224,13 +223,11 @@ class RadarD:
     self.latest_clean_v = 0.0
 
   def _init_csv(self):
-    # 初始化CSV文件，写入表头
     with open(self.csv_file, 'w', newline='') as f:
       writer = csv.writer(f)
       writer.writerow(['cnt', 'sensor_type', 'dRel', 'abs_v', 'ego_v'])
 
   def _log_to_csv(self, cnt, sensor_type, dRel, abs_v, ego_v):
-    # 追加日志到CSV
     with open(self.csv_file, 'a', newline='') as f:
       writer = csv.writer(f)
       writer.writerow([cnt, sensor_type, dRel, abs_v, ego_v])
@@ -258,7 +255,6 @@ class RadarD:
     for vl in sm['modelV2'].leadsV3:
       dRel = vl.x[0] - RADAR_TO_CAMERA
       abs_v = vl.v[0]
-      print(f'拿到的camera相对距离，绝对速度：{dRel}\n{abs_v}')
       self._log_to_csv(self.cnt, 'vision', dRel, abs_v, self.v_ego)
 
 
@@ -346,13 +342,10 @@ def main():
 
   while 1:
     can_strings = messaging.drain_sock_raw(can_sock, wait_for_one=True)
-    # print(f'can_strings的内容是{can_strings}')
     rr = RI.update(can_strings)
     sm.update(0)
-    if rr is None:#与simulated_car里面if self.idx % 5 == 0:有关，每发送五次can信号，里面才包含一次radarcan消息，即使rr的内容是(errors = [], points = [])也不是None
-      print(f'rr的内容是空')
+    if rr is None:
       continue
-    print(f'radard中rr的内容是{rr}')
     RD.update(sm, rr)
     RD.publish(pm, -rk.remaining*1000.0)
 
