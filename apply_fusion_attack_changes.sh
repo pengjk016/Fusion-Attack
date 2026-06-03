@@ -169,7 +169,7 @@ echo "Target: $TARGET_OPENPILOT"
 RELATIVE_FILES=(
   "selfdrive/modeld/modeld.py"
   "selfdrive/controls/radard.py"
-  "selfdrive/controls/dump_model_input_withradar_csv2.py"
+  "selfdrive/controls/dump_model_input.py"
   "tools/sim/launch_openpilot.sh"
   "tools/sim/bridge/metadrive/metadrive_bridge.py"
   "tools/sim/bridge/metadrive/metadrive_process.py"
@@ -186,8 +186,8 @@ copy_file "$VISIONIPC_PYX_SOURCE" "$TARGET_OPENPILOT/cereal/visionipc/visionipc_
 for patch_rel in \
   "selfdrive/modeld/281.npy" \
   "selfdrive/modeld/optimpatch.npy" \
-  "selfdrive/modeld/white.npy" \
-  "selfdrive/modeld/random_gaussian_noise.npy" \
+  "selfdrive/modeld/whitepatch.npy" \
+  "selfdrive/modeld/random_gaussian_noise_patch.npy" \
   "selfdrive/modeld/1.npy"; do
   if [[ -f "$SOURCE_OPENPILOT/$patch_rel" ]]; then
     copy_file "$SOURCE_OPENPILOT/$patch_rel" "$TARGET_OPENPILOT/$patch_rel"
