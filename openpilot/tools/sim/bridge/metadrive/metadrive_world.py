@@ -61,13 +61,12 @@ class MetaDriveWorld(World):
   def read_sensors(self, state: SimulatorState):
     while self.state_recv.poll(0):
       # md_state: metadrive_state = self.state_recv.recv()
-      md_data = self.state_recv.recv()  # 接收元组
+      md_data = self.state_recv.recv()  
       # print(f'md_data: {md_data}')
       if isinstance(md_data, tuple) and len(md_data) == 2:
-        md_state, surrounding_info = md_data  # 解包
+        md_state, surrounding_info = md_data  
         self.surrounding_info = surrounding_info
-        # 这里你可以处理 surrounding_info，例如打印或存储
-        # print(f"Received surrounding_info: {surrounding_info}")
+
       else:
         md_state = md_data
       state.velocity = md_state.velocity
