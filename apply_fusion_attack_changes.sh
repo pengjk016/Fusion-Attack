@@ -170,6 +170,7 @@ RELATIVE_FILES=(
   "selfdrive/modeld/modeld.py"
   "selfdrive/controls/radard.py"
   "selfdrive/controls/dump_model_input_withradar_csv2.py"
+  "tools/sim/launch_openpilot.sh"
   "tools/sim/bridge/metadrive/metadrive_bridge.py"
   "tools/sim/bridge/metadrive/metadrive_process.py"
   "tools/sim/bridge/metadrive/metadrive_world.py"
