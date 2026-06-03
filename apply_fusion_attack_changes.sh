@@ -27,7 +27,7 @@ EOF
 
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SOURCE_OPENPILOT="$SCRIPT_DIR/openpilot"
-VISIONIPC_PYX_SOURCE="$SCRIPT_DIR/../visionipc_pyx.so"
+VISIONIPC_PYX_SOURCE="$SCRIPT_DIR/visionipc_pyx.so"
 TARGET_OPENPILOT=""
 PATCH_NPY=""
 LIDAR_SOURCE="/home/pjk/PycharmProjects/openpilot0.9.6/openpilot/.venv/lib/python3.11/site-packages/metadrive/component/sensors/lidar.py"
