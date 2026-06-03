@@ -263,7 +263,7 @@ def main():
 
   RD = RadarD(CP.radarTimeStep, RI.delay)
 
-  # ==================== CSV 初始化 ====================
+  # ==================== Initialize CSV DOC  ====================
   os.makedirs(CSV_DIR, exist_ok=True)
   CSV_FILE = f"{CSV_DIR}/leadOne.csv"
 
