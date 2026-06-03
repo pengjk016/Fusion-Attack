@@ -18,7 +18,7 @@ from openpilot.common.simple_kalman import KF1D
 
 import csv
 import os
-#一并保存速度信息
+
 SAVE_DIR = "../../attack_picture"
 CSV_DIR = "../../attack_picture"
 START_IDX = 1
@@ -267,7 +267,7 @@ def main():
   os.makedirs(CSV_DIR, exist_ok=True)
   CSV_FILE = f"{CSV_DIR}/leadOne.csv"
 
-  # [修改] 增加纯视觉距离 (raw_vision_dRel) 和自车速度 (vEgo)
+
   fieldnames = ['frame_idx', 'vision_frame_id', 'model_frame_id', 'image_path',
                 'dRel', 'yRel', 'vRel', 'vLead', 'vLeadK',
                 'aLeadK', 'aLeadTau', 'status', 'fcw', 'modelProb', 'radar', 'radarTrackId',
@@ -276,7 +276,7 @@ def main():
   with open(CSV_FILE, 'w', newline='', encoding='utf-8') as csvfile:
     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
     writer.writeheader()
-  print(f"CSV文件已创建: {CSV_FILE}")
+  print(f"CSV doc has been created: {CSV_FILE}")
   # ===================================================
 
   captured_frames = 0
@@ -309,17 +309,17 @@ def main():
 
     RD.update(sm, rr)
 
-    # ==================== 提取纯视觉与车速数据 ====================
+
     raw_vision_dRel = 0.0
     leads_v3 = sm['modelV2'].leadsV3
     if len(leads_v3) > 0:
-      # 减去雷达到相机的偏移，获得与雷达在同一坐标系下的距离
+ 
       raw_vision_dRel = float(leads_v3[0].x[0] - RADAR_TO_CAMERA)
 
     current_v_ego = float(sm['carState'].vEgo) if sm.updated['carState'] else RD.v_ego
     # ===========================================================
 
-    # ==================== 保存 leadOne 到 CSV ====================
+
     lead_one = RD.radar_state.leadOne
     image_path = f"{SAVE_DIR}/{frame_idx}.png"
 
