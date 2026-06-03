@@ -19,8 +19,8 @@ from openpilot.common.simple_kalman import KF1D
 import csv
 import os
 #一并保存速度信息
-SAVE_DIR = "/home/pjk/PycharmProjects/openpilot0.9.6/CAP/data/imgs/test_optim_patch26314"
-CSV_DIR = "/home/pjk/PycharmProjects/openpilot0.9.6/CAP/offline_fusion_results"
+SAVE_DIR = "../../attack_picture"
+CSV_DIR = "../../attack_picture"
 START_IDX = 1
 INTERVAL = 0.05
 NUM_FRAMES = 100
