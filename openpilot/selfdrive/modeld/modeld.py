@@ -168,11 +168,9 @@ def main(demo=False):
   zmq_socket = zmq_context.socket(zmq.SUB)
   zmq_socket.connect("tcp://127.0.0.1:5555")
   zmq_socket.setsockopt_string(zmq.SUBSCRIBE, "")
-  print("ZMQ 客户端已启动，等待接收真实前车 BBox...")
+  print("ZMQ has started，waiting for the BBox...")
 
-  # ==========================================
-  # 预处理对抗补丁：保持真实扰动数值
-  # ==========================================
+
   opt_patch = np.load(Path(__file__).parent / 'optimpatch.npy').astype(np.float32)
 
   if opt_patch.ndim == 3 and opt_patch.shape[0] in [1, 3, 4]:
@@ -261,11 +259,11 @@ def main(demo=False):
     yuv_data = buf_main.data
     img_width = vipc_client_main.width
     img_height = vipc_client_main.height
-    # 简洁版：如果没设置过，默认是 False
+
 
     PATCH_SWITCH_FILE = "/tmp/adversarial_patch_enabled"
 
-    # 检查文件是否存在来决定是否开启
+
     enable_patch_runtime = os.path.exists(PATCH_SWITCH_FILE)
     patch_mode = get_patch_mode()
 
@@ -275,11 +273,7 @@ def main(demo=False):
 
       x1, y1, x2, y2 = target_box
 
-      # =========================================================
-      # 第一步：全距离自适应视距与物理框校准（MetaDrive 3D 框 -> YOLO 视觉框）
-      # 原理：3D物理碰撞盒的固定高度误差，投影到画面上的像素偏差与物体像素高度严格成正比。
-      # 在34.5m处(最佳Y_OFFSET=30)，orig_h约115像素。比例系数 = 30 / 115 ≈ 0.26
-      # =========================================================
+
       orig_w = x2 - x1
       orig_h = y2 - y1
 
@@ -299,9 +293,7 @@ def main(demo=False):
       yolo_y1 = cy - yolo_h / 2.0
       yolo_y2 = cy + yolo_h / 2.0
 
-      # =========================================================
-      # 第二步：离线训练裁剪对齐（YOLO 视觉框 -> 最终补丁贴图框）
-      # 在校准好的视觉框基础上，严格执行离线训练时的裁剪比例，切掉底盘和轮胎。
+
       # =========================================================
       PATCH_CROP_RATIO = [0, 0.72, 0, 1]  # [Top, Bottom, Left, Right]
 
@@ -319,7 +311,7 @@ def main(demo=False):
       if box_h > 0 and box_w > 0:
         resized_patch = cv2.resize(opt_patch, (box_w, box_h), interpolation=cv2.INTER_NEAREST)
 
-        # 安全验证：如果越界则丢弃，防止 Numpy 切片广播报错
+
         if x1 >= 0 and y1 >= 0 and x2 <= img_width and y2 <= img_height:
           roi = bgr_img[y1:y2, x1:x2]
           bgr_img[y1:y2, x1:x2] = apply_patch_to_roi(roi, resized_patch, patch_mode)
