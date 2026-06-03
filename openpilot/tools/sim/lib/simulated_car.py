@@ -55,8 +55,8 @@ def append_dect(surrounding_info):
   Nr = int(np.round(Fs * Tchirp))
 
  
-  range_bin_size = c / (2 * slope * Tchirp)  # 距离 Bin 大小 (约 5.98m)
-  vel_bin_size = c / (2 * fc * Nd * PRI)  # 速度 Bin 大小 (约 0.78m/s)
+  range_bin_size = c / (2 * slope * Tchirp) 
+  vel_bin_size = c / (2 * fc * Nd * PRI) 
 
 
   suppr_r_dynamic = max(1, int(np.ceil(rangeRes / range_bin_size)))
@@ -169,7 +169,6 @@ class SimulatedCar:
             return
         msg = []
 
-        # 获取周边目标信息
         leads = self.sm['modelV2'].leadsV3
         print(f"modelV2 leads: {len(leads)} ")
 
