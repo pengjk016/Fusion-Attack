@@ -1,9 +1,9 @@
 import math
 import numpy as np
-import zmq  # 添加 ZMQ 用于跨进程发坐标
+import zmq  
 
 from collections import namedtuple
-from panda3d.core import Vec3, Point2, Point3  # 添加 Point2, Point3 用于坐标换算
+from panda3d.core import Vec3, Point2, Point3 
 from multiprocessing.connection import Connection
 
 from metadrive.engine.core.engine_core import EngineCore
@@ -24,7 +24,7 @@ C3_HPR = Vec3(0, 0, 0)
 metadrive_state = namedtuple("metadrive_state", ["velocity", "position", "bearing", "steering_angle"])
 
 
-# 前车 3D 转 2D 像素框计算函数
+
 def get_front_vehicle_pixel_data(env, camera_name="rgb_road", width=W, height=H):
   traffic_manager = env.engine.traffic_manager
   if not traffic_manager.vehicles:
@@ -57,7 +57,7 @@ def get_front_vehicle_pixel_data(env, camera_name="rgb_road", width=W, height=H)
 
   l, w, h = front_vehicle.LENGTH, front_vehicle.WIDTH, front_vehicle.HEIGHT
 
-  # [核心修正] 移除人为的 1.15 倍增高，还原真实的车辆顶部物理高度，解决补丁悬空问题
+ 
   h_top = h
   corners_local = [
     Point3(w / 2, l / 2, h_top), Point3(-w / 2, l / 2, h_top),
@@ -151,15 +151,15 @@ def metadrive_process(dual_camera: bool, config: dict, camera_array, wide_camera
   pm = messaging.PubMaster(['surroundingInfo'])
 
   # ==========================================
-  # 初始化 ZMQ 广播端
+
   # ==========================================
   zmq_context = zmq.Context()
   zmq_socket = zmq_context.socket(zmq.PUB)
-  zmq_socket.bind("tcp://127.0.0.1:5555")  # 在本地 5555 端口广播
+  zmq_socket.bind("tcp://127.0.0.1:5555")  
   # ==========================================
 
   while not exit_event.is_set():
-    # === 状态信息 ===
+
     state = metadrive_state(
       velocity=vec3(x=float(env.vehicle.velocity[0]), y=float(env.vehicle.velocity[1]), z=0),
       position=env.vehicle.position,
@@ -184,7 +184,7 @@ def metadrive_process(dual_camera: bool, config: dict, camera_array, wide_camera
 
     state_send.send((state, surrounding_info))
 
-    # === 控制逻辑 ===
+
     if controls_recv.poll(0):
       while controls_recv.poll(0):
         steer_angle, gas, should_reset = controls_recv.recv()
@@ -197,7 +197,7 @@ def metadrive_process(dual_camera: bool, config: dict, camera_array, wide_camera
       if should_reset:
         reset()
 
-    # === 环境 step ===
+   
     if rk.frame % 5 == 0:
       obs, _, terminated, _, info = env.step(vc)
 
@@ -208,12 +208,10 @@ def metadrive_process(dual_camera: bool, config: dict, camera_array, wide_camera
         wide_road_image[...] = get_cam_as_rgb("rgb_wide")
       road_image[...] = get_cam_as_rgb("rgb_road")
 
-      # ==========================================
-      # 计算前车 2D 框并立刻通过 ZMQ 广播
-      # ==========================================
+
       bbox = get_front_vehicle_pixel_data(env, "rgb_road", W, H)
       if bbox is not None:
-        # 发送格式: "u_min,v_min,u_max,v_max"
+
         zmq_socket.send_string(f"{int(bbox[0])},{int(bbox[1])},{int(bbox[2])},{int(bbox[3])}")
       else:
         zmq_socket.send_string("None")
