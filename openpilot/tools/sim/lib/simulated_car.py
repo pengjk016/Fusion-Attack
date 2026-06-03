@@ -1,4 +1,3 @@
-#根据相机模型输出，radar配合攻击
 import cereal.messaging as messaging
 
 from opendbc.can.packer import CANPacker
@@ -12,7 +11,7 @@ import math
 import numpy as np
 import os
 
-# ========================== 2D 峰值检测（取 N 个目标） ==========================
+
 def find_top_k_peaks_2d(mat, k, suppr_v=2, suppr_r=6):
   work = mat.copy()
   peaks = []
@@ -32,36 +31,34 @@ def find_top_k_peaks_2d(mat, k, suppr_v=2, suppr_r=6):
 
 
 def append_dect(surrounding_info):
-  c = 3e8  # 光速 (m/s)
+  c = 3e8  # (m/s)
 
-  # ========================== 雷达基础参数  ==========================
-  fc = 1.5e9  # fc (中心频率) = 1.5 GHz
-  B = 25e6  # B (带宽) = 25.00 MHz
-  slope = 0.05e12  # S (调频斜率) = 0.05 MHz/us = 5e10 Hz/s
-  Tchirp = 501.12e-6  # Tchirp (脉冲宽度) = 501.12 us
-  Nd = 256  # Nchirps (每帧 Chirp 数) = 256
 
-  rangeRes = 6.09  # d_res (距离分辨率) = 6.09 m
-  maxR = 1558.92  # d_max (最大探测距离) = 1558.92 m
-  vRes = 0.78  # v_res (速度分辨率) = 0.78 m/s
-  maxV = 99.71  # v_max (最大速度) = 99.71 m/s
+  fc = 1.5e9  # fc = 1.5 GHz
+  B = 25e6  # B = 25.00 MHz
+  slope = 0.05e12  # S = 0.05 MHz/us = 5e10 Hz/s
+  Tchirp = 501.12e-6  # Tchirp = 501.12 us
+  Nd = 256  # Nchirps = 256
 
-  # ========================== 雷达派生参数计算 ==========================
-  # 1. 脉冲重复间隔 (PRI): 反推自 maxV = c / (4 * fc * PRI)
+  rangeRes = 6.09  # d_res = 6.09 m
+  maxR = 1558.92  # d_max  = 1558.92 m
+  vRes = 0.78  # v_res = 0.78 m/s
+  maxV = 99.71  # v_max = 99.71 m/s
+
+
   PRI = c / (4 * fc * maxV)
 
-  # 2. 采样率 (Fs): 反推自 maxR = Fs * c / (2 * slope)
+
   Fs = maxR * 2 * slope / c
 
-  # 3. 每个 Chirp 的采样点 (Nr): Fs * Tchirp
+
   Nr = int(np.round(Fs * Tchirp))
 
-  # 4. 计算 FFT 矩阵中每个格子（Bin）对应的真实物理尺寸
+ 
   range_bin_size = c / (2 * slope * Tchirp)  # 距离 Bin 大小 (约 5.98m)
   vel_bin_size = c / (2 * fc * Nd * PRI)  # 速度 Bin 大小 (约 0.78m/s)
 
-  # 利用 rangeRes 和 vRes 动态计算峰值检测的抑制窗口
-  # 物理意义：目标能量会扩散到至少 1 个分辨率大小的区域，按比例抑制可防止虚警
+
   suppr_r_dynamic = max(1, int(np.ceil(rangeRes / range_bin_size)))
   suppr_v_dynamic = max(1, int(np.ceil(vRes / vel_bin_size)))
 
@@ -91,21 +88,20 @@ def append_dect(surrounding_info):
         "relative_position": pos
       })
     else:
-      print(f"目标参数超出雷达范围，跳过：距离{r0}m，速度{v0_kmh}km/h（{v0}m/s）")
+      print(f"target out of range, range{r0}m，velocity{v0_kmh}km/h（{v0}m/s）")
 
   if not targets:
     return []
 
-  # ========================== 时间轴 & 发射信号 ==========================
+
   t = np.linspace(0, Nd * Tchirp, Nr * Nd, endpoint=False)
   angle_tx = fc * t + 0.5 * slope * t * t
   Tx = np.cos(2 * np.pi * angle_tx)
 
-  # ========================== 多目标回波 & IF 基带 ==========================
+
   IF_mat = np.zeros((Nd, Nr))
   lambda_ = c / fc
 
-  # ✅ 修复漏洞：改为遍历 targets 数组，累加所有目标的 IF 信号
   for tgt in targets:
     r_t = tgt["r0"]
     v_t = tgt["v0"]
@@ -116,9 +112,9 @@ def append_dect(surrounding_info):
       phase = 4 * np.pi * (r_t + v_t * d * PRI) / lambda_
       t_chirp = np.linspace(0, Tchirp, Nr)
       IF_chirp = amp * np.cos(2 * np.pi * (fb * t_chirp + phase / (2 * np.pi)))
-      IF_mat[d] += IF_chirp  # 叠加多目标回波
+      IF_mat[d] += IF_chirp  
 
-  # DSP 处理
+  # DSP 
   win_r = np.hanning(Nr)
   win_d = np.hanning(Nd)
   Xr = np.fft.rfft(IF_mat * win_r[np.newaxis, :], n=Nr, axis=1)
@@ -128,24 +124,23 @@ def append_dect(surrounding_info):
   fd = np.fft.fftshift(np.fft.fftfreq(Nd, d=PRI))
   vel_axis = fd * c / (2 * fc)
 
-  # 有效范围过滤
+
   valid_r = (range_axis >= 0) & (range_axis <= maxR)
   valid_v = (vel_axis >= -maxV) & (vel_axis <= maxV)
   RD = np.abs(Xd[np.ix_(valid_v, valid_r)])
 
-  # ========================== 峰值检测 ==========================
-  # ✅ 传入用距离/速度分辨率动态计算出来的 suppr 窗口
+
   peaks_2d = find_top_k_peaks_2d(RD, k=len(targets), suppr_v=suppr_v_dynamic, suppr_r=suppr_r_dynamic)
 
   detections = []
   for (vi, ri, val) in peaks_2d:
-        # ✅ 新增：记录横向位置（若有），供CAN消息使用
+
         lat_pos = targets[len(detections)]['relative_position'][1] if (len(targets) > len(detections) and len(targets[len(detections)]['relative_position'])>1) else 0.0
         detections.append({
-            "R": range_axis[valid_r][ri],  # 纵向距离（m）
-            "V": vel_axis[valid_v][vi],    # 纵向相对速度（m/s）
+            "R": range_axis[valid_r][ri],  # （m）
+            "V": vel_axis[valid_v][vi],    # （m/s）
             "P_dB": 20 * np.log10(val + 1e-12),
-            "Y": lat_pos  # 横向位置（m）
+            "Y": lat_pos  # （m）
         })
   return detections
 
@@ -176,45 +171,42 @@ class SimulatedCar:
 
         # 获取周边目标信息
         leads = self.sm['modelV2'].leadsV3
-        print(f"modelV2 leads: {len(leads)} 个前车")
+        print(f"modelV2 leads: {len(leads)} ")
 
-        #e.g.(openpilot-py3.11) pjk@pjkcomputer:~/PycharmProjects/openpilot0.9.6/openpilot$ touch /tmp/adversarial_patch_enabled
+        #e.g.(openpilot-py3.11)~/PycharmProjects/openpilot0.9.6/openpilot$ touch /tmp/adversarial_patch_enabled
         attack_enabled = os.path.exists("/tmp/adversarial_patch_enabled")
 
-        # 获取周边目标信息
+
         if attack_enabled:
-          # 攻击模式：优先使用 modelV2 (被攻击后的视觉) 的输出来欺骗雷达
           leads = self.sm['modelV2'].leadsV3
-          print(f"[攻击模式] modelV2 leads: {len(leads)} 个前车")
+          print(f"[attack on] modelV2 leads: {len(leads)} ")
           surrounding_info = []
           for i, lead in enumerate(leads):
-            dRel = lead.x[0] - 1.52-13# 相对距离
-            vRel = lead.v[0] - simulator_state.speed # 相对速度(m/s)
-            print(f"[攻击模式] Lead {i}: dRel={dRel:.2f}m, vRel={vRel:.2f}m/s")
+            dRel = lead.x[0] - 1.52
+            vRel = lead.v[0] - simulator_state.speed # (m/s)
+            print(f"[attack off] Lead {i}: dRel={dRel:.2f}m, vRel={vRel:.2f}m/s")
             surrounding_info = [{'relative_position': [dRel, 0], 'relative_velocity': [vRel * 3.6, 0]}]
 
           if len(leads) == 0:
-            # 视觉没拿到信息时，回退到模拟器原始数据
+ 
             surrounding_info = getattr(simulator_state, "surrounding_info", None)
         else:
-          # 正常模式：直接使用模拟器的真实数据
-          print(f"[正常模式] 使用模拟器原始雷达数据")
+          print(f"[attack off] ")
           leads = self.sm['modelV2'].leadsV3
           surrounding_info = []
           for i, lead in enumerate(leads):
-            dRel = lead.x[0] - 1.52  # 相对距离
-            vRel = lead.v[0] - simulator_state.speed  # 相对速度(m/s)
-            print(f"[正常模式] Lead {i}: dRel={dRel:.2f}m, vRel={vRel:.2f}m/s")
+            dRel = lead.x[0] - 1.52  
+            vRel = lead.v[0] - simulator_state.speed  # (m/s)
+            print(f"[attack off] Lead {i}: dRel={dRel:.2f}m, vRel={vRel:.2f}m/s")
             surrounding_info = [{'relative_position': [dRel, 0], 'relative_velocity': [vRel * 3.6, 0]}]
           if len(leads) == 0:
-            # 视觉没拿到信息时，回退到模拟器原始数据
+   
             surrounding_info = getattr(simulator_state, "surrounding_info", None)
 
-        # 接收append_dect的返回值，定义detections变量
+
         detections = append_dect(surrounding_info)
 
 
-        # *** powertrain bus ***（与原代码一致，无修改）
         speed = simulator_state.speed * 3.6  # convert m/s to kph
         msg.append(self.packer.make_can_msg("ENGINE_DATA", 0, {"XMISSION_SPEED": speed}))
         msg.append(self.packer.make_can_msg("WHEEL_SPEEDS", 0, {
@@ -259,30 +251,28 @@ class SimulatedCar:
         msg.append(self.packer.make_can_msg("HUD_SETTING", 0, {}))
         msg.append(self.packer.make_can_msg("CAR_SPEED", 0, {}))
 
-        # *** cam bus ***（与原代码一致，无修改）
+        # *** cam bus ***
         msg.append(self.packer.make_can_msg("STEERING_CONTROL", 2, {}))
         msg.append(self.packer.make_can_msg("ACC_HUD", 2, {}))
         msg.append(self.packer.make_can_msg("LKAS_HUD", 2, {}))
         msg.append(self.packer.make_can_msg("BRAKE_COMMAND", 2, {}))
 
-        # *** radar bus ***（✅ 关键修改：使用有效detections，适配横向位置）
+
         if self.idx % 5 == 0:
-            # radar 状态消息
             msg.append(self.rpacker.make_can_msg("RADAR_DIAGNOSTIC", 1, {"RADAR_STATE": 0x79}))
-            # 最多 16 个 track
             max_tracks = 16
             for i in range(max_tracks):
                 if i < len(detections):
                     det = detections[i]
                     msg.append(self.rpacker.make_can_msg("TRACK_%d" % i, 1, {
-                        "LONG_DIST": float(det["R"]),  # 纵向距离（m）
+                        "LONG_DIST": float(det["R"]),  # （m）
                         "LAT_DIST": float(det.get("Y", 0.0)),  
-                        "REL_SPEED": float(det["V"]),  # 纵向相对速度（m/s）
+                        "REL_SPEED": float(det["V"]),  # （m/s）
                     }))
                 else:
-                    # 没有目标时填充无效数据
+
                     msg.append(self.rpacker.make_can_msg("TRACK_%d" % i, 1, {
-                        "LONG_DIST": 255.5,  # 无效距离
+                        "LONG_DIST": 255.5,  
                         "LAT_DIST": 0.0,
                         "REL_SPEED": 0.0,
                     }))
