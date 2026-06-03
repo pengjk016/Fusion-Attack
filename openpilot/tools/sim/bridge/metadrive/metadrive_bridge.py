@@ -78,38 +78,7 @@ def create_map(track_size=30):
     ]
   )
 
-# def create_map(track_size=60):
-#   return dict(
-#     type=MapGenerateMethod.PG_MAP_FILE,
-#     lane_num=1,
-#     lane_width=6,
-#
-#     config=[
-#       None,
-#       straight_block(50),
-#       straight_block(50),
-#       straight_block(50),
-#       straight_block(50),
-#       straight_block(50),
-#       straight_block(50),
-#       straight_block(50),
-#       straight_block(50),
-#       straight_block(50),
-#       straight_block(50),
-#
-#     ]
-#   )
 
-# def create_map(length=2000):
-#   return dict(
-#     type=MapGenerateMethod.PG_MAP_FILE,
-#     lane_num=3,  # 车道数，改多一点更真实
-#     lane_width=3.5,
-#     config=[
-#       None,
-#       straight_block(length),  # 一条超长直道
-#     ]
-#   )
 
 
 class MetaDriveBridge(SimulatorBridge):
@@ -136,7 +105,6 @@ class MetaDriveBridge(SimulatorBridge):
       ),
       sensors=sensors,
       image_on_cuda=False,
-      # agent_observation=LidarStateObservation,#根據metadrive官方文檔配置，不知道有沒有必要
       image_observation=True,
       interface_panel=[],
       out_of_route_done=False,
