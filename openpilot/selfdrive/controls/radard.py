@@ -177,11 +177,10 @@ def get_lead(v_ego: float, ready: bool, tracks: Dict[int, Track], lead_msg: capn
   lead_dict = {'status': False}
   if track is not None:
     lead_dict = track.get_RadarState(lead_msg.prob)
-    print('执行的是get_RadarState')
+
   elif (track is None) and ready and (lead_msg.prob > .5):
     lead_dict = get_RadarState_from_vision(lead_msg, v_ego, model_v_ego)
-    print('执行的是get_RadarState_from_vision')
-
+ 
   if low_speed_override:
     low_speed_tracks = [c for c in tracks.values() if c.potential_low_speed_lead(v_ego)]
     if len(low_speed_tracks) > 0:
@@ -300,7 +299,7 @@ class RadarD:
     radar_msg.radarState = self.radar_state
     radar_msg.radarState.cumLagMs = lag_ms
     pm.send("radarState", radar_msg)
-    print(f'发送了radar信息，内容是{radar_msg}')
+    print(f'sending radarstate:{radar_msg}')
     self._log_to_csv(self.cnt, 'leadone', self.radar_state.leadOne.dRel, self.radar_state.leadOne.vRel + self.v_ego,
                      self.v_ego)
     # publish tracks for UI debugging (keep last)
