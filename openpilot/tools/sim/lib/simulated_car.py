@@ -178,7 +178,7 @@ class SimulatedCar:
 
         if attack_enabled:
           leads = self.sm['modelV2'].leadsV3
-          print(f"[attack on] modelV2 leads: {len(leads)} ")
+          print(f"modelV2 leads: {len(leads)} ")
           surrounding_info = []
           for i, lead in enumerate(leads):
             dRel = lead.x[0] - 1.52
