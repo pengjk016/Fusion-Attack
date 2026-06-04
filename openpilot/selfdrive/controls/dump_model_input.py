@@ -370,7 +370,7 @@ def main():
       writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
       writer.writerow(row)
 
-    print(f"Saved frame {frame_idx} | Vision dRel: {raw_vision_dRel:.2f}m | vEgo: {current_v_ego:.2f}m/s")
+    print(f"Saved frame {frame_idx} | dRel: {raw_vision_dRel:.2f}m | vEgo: {current_v_ego:.2f}m/s")
     # ===========================================================
 
     time.sleep(INTERVAL)
