@@ -183,7 +183,7 @@ class SimulatedCar:
           for i, lead in enumerate(leads):
             dRel = lead.x[0] - 1.52
             vRel = lead.v[0] - simulator_state.speed # (m/s)
-            print(f"[attack off] Lead {i}: dRel={dRel:.2f}m, vRel={vRel:.2f}m/s")
+            print(f"[attack on] Lead {i}: dRel={dRel:.2f}m, vRel={vRel:.2f}m/s")
             surrounding_info = [{'relative_position': [dRel, 0], 'relative_velocity': [vRel * 3.6, 0]}]
 
           if len(leads) == 0:
