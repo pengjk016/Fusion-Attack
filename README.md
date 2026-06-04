@@ -1,6 +1,6 @@
 # Camera-Radar Fusion Attack Validation Framework
 
-This project is an advanced development framework built on top of [commaai/openpilot v0.9.6](https://github.com/commaai/openpilot/tree/v0.9.6). It is specifically designed to validate the effectiveness of our proposed **Camera-Radar Fusion Attack** against autonomous driving perception systems.
+This project is an advanced development framework built on top of [commaai/openpilot v0.9.6](https://github.com/commaai/openpilot/tree/v0.9.6). It is developed and validated under an Ubuntu 20.04 LTS environment and is specifically designed to evaluate the effectiveness of our proposed **Camera-Radar Fusion Attack** against autonomous driving perception systems.
 
 ## ✨ Key Features & Improvements
 
